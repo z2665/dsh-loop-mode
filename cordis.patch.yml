@@ -1,0 +1,28 @@
+# dsh-loop-mode bundle patch: inserts the plugin row at the profile top level.
+# Dual-face plugin: the Node half (src/index.ts) provides the /loop command,
+# mode projection, guidance, hard-gate listeners and the loop_* tools; the
+# browser half (lib/client.js) renders the settings card on the Plugins page.
+# Everything is per-session and only active after `/loop on` writes its
+# durable session event; default state is completely inert.
+#
+# Optional config (a later profile layer may override; the settings card
+# writes these as volatile fields — live without restart):
+#   - id: dsh-loop-mode
+#     config:
+#       defaultOn: false                    # volatile; inherited by sessions without /loop override
+#       gate: true                          # volatile; structural hard gate while the mode is on
+#       maxRounds: 3                        # volatile; corrective-round cap per goal (maxGoalRounds)
+#       generalModel: ''                    # volatile; tier=general executor route ("provider/model", ''=inherit)
+#       generalEffort: ''                   # volatile; general executor effort
+#       seniorModel: ''                     # volatile; tier=senior executor route
+#       seniorEffort: ''                    # volatile; senior executor effort
+#       verifyModel: ''                     # volatile; verifier route
+#       verifyEffort: ''                    # volatile; verifier effort
+#       quickVerifyBudget: 3                # volatile; quick rounds per goal before full review is mandatory
+#       loopPresetId: loop                  # volatile; the agent preset id that defaults the mode ON
+#       delegateProvider: ''                # non-volatile; subagent provider name (default: auto-select)
+#       gateAllowlistExtra: []              # non-volatile; extra tool names the gate keeps
+#       commandName: loop                   # non-volatile; slash-command name
+- insert:
+    - id: dsh-loop-mode
+      name: dsh-loop-mode

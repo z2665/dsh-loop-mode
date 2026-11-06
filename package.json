@@ -1,0 +1,48 @@
+{
+  "name": "dsh-loop-mode",
+  "version": "0.7.1",
+  "license": "MIT",
+  "private": false,
+  "type": "module",
+  "main": "src/index.ts",
+  "files": [
+    "src",
+    "lib",
+    "test",
+    "presets",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "exports": {
+    ".": "./src/index.ts",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=23.6"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": [
+        "./cordis.patch.yml",
+        "./presets/loop.patch.yml"
+      ]
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.5"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-session": "*"
+  },
+  "description": "A minimal cybernetics loop MODE for DSH: /loop on turns the session into a controller (goal setpoint -> fresh subagent task -> independent plugin-authored verify -> calibrate) behind a structural hard gate, with an append-only goal revision chain (loop_revise) and schema-enforced verdicts (loop_verify). Completely inert while off."
+}
