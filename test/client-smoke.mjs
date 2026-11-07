@@ -136,6 +136,8 @@ await okAsync('catalog store: loads groups into options; handles failure; notifi
 })
 
 ok('availability + effort helpers', () => {
+  assert.equal(typeof client.CLEAR_SENTINEL, 'string')
+  assert.ok(client.CLEAR_SENTINEL.length > 0)
   const snap = { status: 'ready', options: [
     { value: 'p1/m1', provider: 'p1', model: 'm1', reasoning: { efforts: [{ id: 'low' }, { id: 'high' }], defaultEffort: 'high' }, label: 'x' },
     { value: 'p2/m2', provider: 'p2', model: 'm2', label: 'y' },
