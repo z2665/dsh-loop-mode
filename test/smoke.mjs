@@ -403,6 +403,11 @@ ok('verdict schema pinned; fence nonce varies per prompt', () => {
   const b = protocol.buildVerifierPrompt({ objective: 'O', criteria: 'C', deliverable: 'D' })
   const nonceOf = (s) => (s.match(/nonce=([a-z0-9]+)/) ?? [])[1]
   assert.ok(nonceOf(a) !== undefined && nonceOf(b) !== undefined && nonceOf(a) !== nonceOf(b))
+  // G4: the nonce is crypto-random hex — marker-line-regex compatible
+  // ([a-z0-9]+) and inside the delegation ledger's 1-64 length validation
+  for (const n of [nonceOf(a), nonceOf(b), protocol.fenceNonce()]) {
+    assert.match(n, /^[0-9a-f]{16}$/)
+  }
 })
 
 ok('buildGuidance: roles + routing section; two executor tiers present', () => {

@@ -2,10 +2,12 @@
  * Pure protocol logic for dsh-loop-mode: the hard-gate allowlist, the control
  * loop guidance text, the plugin-authored verifier prompt + verdict schema,
  * the tool filters, and top-level-agent detection. No host imports —
- * everything here is offline-testable.
+ * everything here is offline-testable (node:crypto is a Node builtin, not a
+ * host dependency).
  *
  * @module dsh-loop-mode/protocol
  */
+import { randomBytes } from 'node:crypto'
 
 /**
  * Structural survival set for the hard gate (allowlist semantics): the
@@ -123,9 +125,14 @@ export interface VerifierPromptOptions {
  * fenced content is DATA — never instructions — and fence-mimicking lines
  * inside a value are neutralized so injected text cannot close the fence and
  * re-open a fake plugin section.
+ *
+ * The nonce is crypto-random (security G4): Math.random is predictable, and
+ * an attacker who can foresee nonce values could pre-craft fence-mimicking
+ * collisions. 16 lowercase hex chars (randomBytes(8)) still satisfy the
+ * marker-line regex [a-z0-9]+ and the delegation ledger's 1-64 length check.
  */
 export function fenceNonce(): string {
-  return Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10)
+  return randomBytes(8).toString('hex')
 }
 
 /** Strip lines that would mimic or break the fence protocol. */
