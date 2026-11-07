@@ -329,18 +329,22 @@ THE LOOP — setpoint → act → measure → calibrate:
    - Bounded lookup / lightweight read-only analysis → one task round is enough (quick): report the
      result directly, no verifier.
    - Complex analysis or ANY world-changing work → full round: continue to measure.
-3. MEASURE — TIERED VERIFICATION. Call loop_verify with {criteria, deliverable, report}:
-   - mode="quick" (default): ONE independent verifier, short-term quality focus ("does it work
-     now, any obvious defects"). Iterate with quick rounds while correcting.
-   - mode="full": THREE independent reviewers — architecture & conformance, security, code
-     quality — each with the same evidence discipline. met for the round requires ALL THREE to
-     pass; aggregate the gaps from every direction into the corrective brief.
-   Pacing rule: after ${quickVerifyBudget} consecutive quick rounds on the same goal the next verification
-   MUST be full (the tool refuses quick past its budget), and ANY world-changing or complex goal
-   gets a full review before you report met. The plugin composes every verifier's prompt, route
-   and output schema — never trust the executor's narrative; read the verdicts as they return.
+3. MEASURE — TIERED VERIFICATION, QUICK-FIRST. Call loop_verify with {criteria, deliverable, report}:
+   - mode="quick" is the DEFAULT for every verification: one independent verifier, short-term
+     quality focus ("does it work now, any obvious defects"). Bounded lookups, routine changes,
+     documentation, and iteration feedback are quick work — do not spend more on them.
+   - mode="full" (three independent reviewers — architecture & conformance, security, code
+     quality; met requires ALL THREE) is RESERVED for milestone deliverables: a substantial
+     staged artifact handed to the user — a completed build, a release-ready change, the goal's
+     final acceptance before you report met on a major delivery. Intermediate rounds never
+     need full.
+   Pacing rule: after ${quickVerifyBudget} quick rounds on the same goal the next verification
+   MUST be full (the tool refuses quick past its budget). Escalate to full early when quick
+   verdicts keep failing or flag goalQuestionable. The plugin composes every verifier's prompt,
+   route and output schema — never trust the executor's narrative; read the verdicts as they return.
 4. CALIBRATE. Decide from the verdict:
-   - met → report the outcome to the user, call loop_pause (disarms the platform's auto-rounds so the
+   - met → for a MILESTONE deliverable make sure its acceptance went through a full review
+     first; then report the outcome to the user, call loop_pause (disarms the platform's auto-rounds so the
      loop waits instead of burning budget), and WAIT. Completion is the user's act — their /goal
      command or UI; you have no complete verb. If the user wants more work on it: loop_resume.
    - not met, and rounds remain → launch a corrective round: a new loop_task brief built from the

@@ -268,6 +268,14 @@ ok('improvementHints: repeated gaps, no-verify loop, revision classification', (
     { ts: 't7', kind: 'verdict', met: true, gaps: [] },
   ]))
   assert.ok(soft.some((h) => h.includes('验收标准是否偏软')))
+  assert.ok(soft.some((h) => h.includes('quick 优先')))
+  // quick-first usage → no drift hint
+  const quickFirst = audit.improvementHints(audit.summarizeAudit([
+    { ts: 't1', kind: 'verify', mode: 'quick' },
+    { ts: 't2', kind: 'verify', mode: 'quick' },
+    { ts: 't3', kind: 'verify', mode: 'full' },
+  ]))
+  assert.ok(!quickFirst.some((h) => h.includes('quick 优先')))
 })
 
 // ---------------------------------------------------------------------------
@@ -578,10 +586,12 @@ if (plugin !== undefined) {
 
   await okAsync('guidance carries the tiered-verification pacing rule', () => {
     const text = protocol.buildGuidance({ maxRounds: 3, gate: true, quickVerifyBudget: 3 })
+    assert.ok(text.includes('QUICK-FIRST'))
     assert.ok(text.includes('mode="quick"'))
     assert.ok(text.includes('mode="full"'))
-    assert.ok(text.includes('after 3 consecutive quick rounds'))
-    assert.ok(text.includes('ALL THREE'))
+    assert.ok(text.includes('RESERVED for milestone deliverables'))
+    assert.ok(text.includes('after 3 quick rounds'))
+    assert.ok(text.includes('MILESTONE deliverable'))
   })
 
   await okAsync('loop_* tools refuse delegated children (defense in depth)', async () => {

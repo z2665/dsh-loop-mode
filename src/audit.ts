@@ -237,6 +237,9 @@ export function improvementHints(summary: AuditSummary): string[] {
   if (summary.verifies.verdicts >= 3 && summary.verifies.met === summary.verifies.verdicts && summary.goals.reviseCorrections === 0 && summary.tasks.launched > 0) {
     hints.push(`验收 ${summary.verifies.met}/${summary.verifies.verdicts} 全过且零矫正——回路很顺，但若这成为常态，检查验收标准是否偏软（gaps 是否只有化妆级问题）。`)
   }
+  if (summary.verifies.quick === 0 && summary.verifies.full >= 3) {
+    hints.push(`全部验收都走了 full（${summary.verifies.full} 方向启动，quick 为 0）——协议是 quick 优先：full 留给阶段性交付与预算强制，中间轮次用 quick 可省约 2/3 验收成本。`)
+  }
   return hints
 }
 

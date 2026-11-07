@@ -718,12 +718,14 @@ export function apply(ctx: any, config: Partial<Config> = {}) {
     const verifyDisposer = ctx.tools.register({
       name: 'loop_verify',
       description:
-        'Commission INDEPENDENT verification for a finished task round. The plugin — not the calling ' +
-        'agent — composes every verifier\'s prompt and output schema. mode="quick" (default): ONE ' +
-        'fresh verifier with a short-term quality focus. mode="full": THREE independent reviewers — ' +
-        'architecture & conformance, security, code quality — met requires ALL THREE to pass. After ' +
-        'the per-goal quick budget is spent the tool REFUSES quick and demands full. Supply the ' +
-        'acceptance criteria, where the deliverable lives, and the executor\'s report (claims, never evidence).',
+        'Commission INDEPENDENT verification for a finished task round. QUICK-FIRST policy: ' +
+        'mode="quick" (default) — ONE fresh verifier, short-term quality focus — is the right cost ' +
+        'for every routine verification and iteration round. mode="full" — THREE independent ' +
+        'reviewers (architecture & conformance, security, code quality; met requires ALL THREE) — is ' +
+        'reserved for MILESTONE deliverables: substantial staged artifacts handed to the user and the ' +
+        'final acceptance of a major delivery. After the per-goal quick budget is spent the tool ' +
+        'REFUSES quick and demands full. Supply the acceptance criteria, where the deliverable lives, ' +
+        'and the executor\'s report (claims, never evidence).',
       parameters: {
         type: 'object',
         properties: {
