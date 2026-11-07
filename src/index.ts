@@ -52,6 +52,7 @@ import {
 } from './routes.ts'
 import {
   appendAudit, auditFile, preview, parseStructuredResult, summarizeAudit, renderReport, readAudit,
+  memoryLessonLines,
 } from './audit.ts'
 
 export const name = 'dsh-loop-mode'
@@ -96,6 +97,8 @@ export const Config = z.object({
     .description('loop_task / loop_verify 使用的 subagent provider 名（非 volatile，缺省/留空自动选择且经能力校验：跳过继承父上下文或缺少所需能力的 provider）。修改需插件重载。'),
   gateAllowlistExtra: z.array(z.string())
     .description('硬门 allowlist 追加项（非 volatile）：在本部署需要保留给控制器的额外工具名。修改需插件重载。'),
+  memoryJoin: z.boolean().default(false).volatile()
+    .description('/loop report 记忆 join（默认 false，volatile，M3）：开启后 /loop report 以只读方式读取 <workspace>/.loop-memory/ 的 lesson 记录（本会话流水 + 审计时间窗内的 workspace 教训）并附在测量报告后。目录不存在或无 lesson 时静默跳过；loop-mode 与 loop-memory 保持互相独立（不导入，JSONL 布局即契约）。'),
   commandName: z.string().default('loop')
     .description('斜杠命令名（默认 loop，非 volatile）。修改需插件重载。'),
 })
@@ -165,6 +168,8 @@ export function apply(ctx: any, config: Partial<Config> = {}) {
     return Number.isFinite(value) && value >= 1 ? Math.floor(value) : 3
   }
   const allow = (): Set<string> => resolveGateAllowlist(config.gateAllowlistExtra)
+  // M3: /loop report read-only memory join (default OFF, design §4).
+  const memoryJoin = (): boolean => readConfigField(config.memoryJoin, false) === true
   // --- full-chain observability (best-effort audit trail) -------------------
   // childId -> which loop role launched it (settlement correlation).
   const childRoles = new Map<string, { role: 'task' | 'verify'; tier?: 'general' | 'senior'; sessionId: string }>()
@@ -1033,7 +1038,17 @@ export function apply(ctx: any, config: Partial<Config> = {}) {
           return { kind: 'error' as const, text: 'loop report: 工作区根目录或会话 id 不可用。' }
         }
         const events = await readAudit(root, sessionId)
-        return { kind: 'success' as const, text: renderReport(summarizeAudit(events), auditFile(root, sessionId)) }
+        let text = renderReport(summarizeAudit(events), auditFile(root, sessionId))
+        // M3: optional read-only lesson join (memoryJoin, default false; the
+        // helper reads .loop-memory/ only when it exists and stays silent
+        // otherwise — the two plugins never import each other).
+        if (memoryJoin()) {
+          const lessons = await memoryLessonLines(root, sessionId, events)
+          if (lessons.length > 0) {
+            text += `\n\n记忆教训 join（loop-memory，只读）：\n${lessons.join('\n')}`
+          }
+        }
+        return { kind: 'success' as const, text }
       }
       // No argument (or unknown text) = status report.
       const override = modeOverrideOf(ctx, session)

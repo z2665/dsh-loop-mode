@@ -273,3 +273,94 @@ export function renderReport(summary: AuditSummary, filePath: string): string {
   lines.push('', `审计流水（append-only）：${filePath}`)
   return lines.join('\n')
 }
+
+// --- M3: read-only loop-memory lesson join (design §4) ----------------------
+
+/** Slack around the audit window for workspace lessons to join (M3). */
+export const MEMORY_JOIN_WINDOW_MS = 3_600_000
+
+/** Minimal record shape read from .loop-memory JSONL (duck-typed). */
+interface MemoryLikeRecord {
+  ts?: unknown
+  kind?: unknown
+  ns?: unknown
+  role?: unknown
+  text?: unknown
+  data?: unknown
+  id?: unknown
+  supersede?: unknown
+}
+
+/** Parse one JSONL file of memory records; unreadable → [] (read-only join). */
+async function readMemoryFile(path: string): Promise<MemoryLikeRecord[]> {
+  let raw: string
+  try {
+    raw = await readFile(path, 'utf8')
+  } catch {
+    return []
+  }
+  const records: MemoryLikeRecord[] = []
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim()
+    if (trimmed.length === 0) continue
+    try {
+      const parsed = JSON.parse(trimmed) as MemoryLikeRecord
+      if (parsed !== null && typeof parsed === 'object' && parsed.kind === 'lesson') records.push(parsed)
+    } catch { /* foreign/corrupt lines are not ours to judge */ }
+  }
+  return records
+}
+
+/**
+ * The /loop report's read-only memory join (M3, loop-memory design §4; the
+ * config gate `memoryJoin` defaults OFF): lessons from dsh-loop-memory's
+ * `.loop-memory/` — this session's own flow file joins unconditionally;
+ * workspace lessons join when their ts falls inside the audit window ±
+ * MEMORY_JOIN_WINDOW_MS; superseded revisions fold out. This is a deliberate
+ * minimal MIRROR of loop-memory's pure src/join.ts semantics (both tested):
+ * the plugins stay import-independent — the JSONL layout is the contract.
+ * Returns [] when `.loop-memory/` does not exist or holds no lessons.
+ */
+export async function memoryLessonLines(root: string, sessionId: string, events: AuditEvent[]): Promise<string[]> {
+  const dir = join(root, '.loop-memory')
+  const files = [join(dir, 'workspace.jsonl'), join(dir, 'sessions', `${auditFileStem(sessionId)}.jsonl`)]
+  const lessons: MemoryLikeRecord[] = []
+  const superseded = new Set<string>()
+  const collected: MemoryLikeRecord[] = []
+  for (const file of files) collected.push(...(await readMemoryFile(file)))
+  for (const record of collected) {
+    if (Array.isArray(record.supersede)) {
+      for (const id of record.supersede) if (typeof id === 'string') superseded.add(id)
+    }
+  }
+  const stamps = events.map((e) => (typeof e.ts === 'string' ? Date.parse(e.ts) : Number.NaN)).filter((n) => !Number.isNaN(n))
+  const first = stamps.length > 0 ? Math.min(...stamps) : null
+  const last = stamps.length > 0 ? Math.max(...stamps) : null
+  for (const record of collected) {
+    if (typeof record.id === 'string' && superseded.has(record.id)) continue
+    const ns = typeof record.ns === 'string' ? record.ns : ''
+    if (ns === `session(${sessionId})`) {
+      // this session's own lesson — always joins
+    } else if (ns === 'workspace') {
+      if (first === null || last === null) continue
+      const at = typeof record.ts === 'string' ? Date.parse(record.ts) : Number.NaN
+      if (Number.isNaN(at) || at < first - MEMORY_JOIN_WINDOW_MS || at > last + MEMORY_JOIN_WINDOW_MS) continue
+    } else {
+      continue
+    }
+    lessons.push(record)
+  }
+  lessons.sort((a, b) => (String(a.ts) < String(b.ts) ? -1 : 1))
+  return lessons.map((record) => {
+    const data = record.data as Record<string, unknown> | null | undefined
+    const fields: string[] = []
+    if (data !== null && typeof data === 'object') {
+      if (typeof data.verdict === 'string' && data.verdict.length > 0) fields.push(`verdict=${data.verdict}`)
+      if (typeof data.round === 'number' && Number.isFinite(data.round)) fields.push(`round=${data.round}`)
+      if (typeof data.gap === 'string' && data.gap.length > 0) fields.push(`gap="${preview(data.gap, 40)}"`)
+      if (typeof data.fix === 'string' && data.fix.length > 0) fields.push(`fix="${preview(data.fix, 40)}"`)
+    }
+    const where = record.ns === 'workspace' ? 'workspace' : 'session'
+    return `- [${String(record.ts)}] ${where}/${String(record.role)}：${preview(record.text, 100)}${fields.length > 0 ? `（${fields.join(' ')}）` : ''}`
+  })
+}

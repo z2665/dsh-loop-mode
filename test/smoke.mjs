@@ -278,6 +278,40 @@ ok('summarizeAudit aggregates the full chain', () => {
   assert.ok(report.includes('/tmp/x.jsonl'))
 })
 
+ok('memoryLessonLines (M3 join): session ns always; workspace window; superseded folded; absent → []', async () => {
+  const { mkdir, writeFile } = await import('node:fs/promises')
+  const root = await mkdtemp(joinPath(tmpdir(), 'loop-mode-mjoin-'))
+  // absent .loop-memory/ → [] (the config gate's existence requirement)
+  assert.deepEqual(await audit.memoryLessonLines(root, 's-j', [{ ts: '2026-11-07T10:00:00.000Z', kind: 'mode' }]), [])
+  // seed: one session lesson, one workspace lesson inside the audit window,
+  // one far outside, one superseded by a synthetic revision
+  const memDir = joinPath(root, '.loop-memory')
+  await mkdir(joinPath(memDir, 'sessions'), { recursive: true })
+  const sessionLesson = { ts: '2026-11-07T10:30:00.000Z', kind: 'lesson', ns: 'session(s-j)', role: 'controller', id: 'm-1', text: 'verify before pause', data: { verdict: 'met', round: 2, gap: '', fix: 'rerun tests' } }
+  const wsIn = { ts: '2026-11-07T11:00:00.000Z', kind: 'lesson', ns: 'workspace', role: 'controller', id: 'm-2', text: 'fence untrusted briefs' }
+  const wsOut = { ts: '2025-01-01T00:00:00.000Z', kind: 'lesson', ns: 'workspace', role: 'controller', id: 'm-3', text: 'ancient lesson' }
+  const wsDup = { ts: '2026-11-07T11:30:00.000Z', kind: 'lesson', ns: 'workspace', role: 'controller', id: 'm-4', text: 'fence untrusted briefs v2', supersede: ['m-2'] }
+  const noteNoise = { ts: '2026-11-07T11:31:00.000Z', kind: 'note', ns: 'workspace', role: 'controller', id: 'm-5', text: 'not a lesson' }
+  await writeFile(joinPath(memDir, 'workspace.jsonl'),
+    [wsIn, wsOut, wsDup, noteNoise].map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf8')
+  await writeFile(joinPath(memDir, 'sessions', 's-j.jsonl'), JSON.stringify(sessionLesson) + '\n', 'utf8')
+  const events = [
+    { ts: '2026-11-07T10:00:00.000Z', kind: 'mode' },
+    { ts: '2026-11-07T12:00:00.000Z', kind: 'verdict' },
+  ]
+  const lines = await audit.memoryLessonLines(root, 's-j', events)
+  assert.equal(lines.length, 2) // session lesson + the superseding revision (m-2 folded out, note ignored)
+  assert.ok(lines[0].includes('verify before pause'))
+  assert.ok(lines[0].includes('verdict=met'))
+  assert.ok(lines[0].includes('fix="rerun tests"'))
+  assert.ok(lines[1].includes('fence untrusted briefs v2'))
+  assert.ok(!lines.join('\n').includes('ancient lesson')) // outside the window
+  // no parseable audit ts → workspace lessons never join
+  const bare = await audit.memoryLessonLines(root, 's-j', [])
+  assert.equal(bare.length, 1)
+  assert.ok(bare[0].includes('verify before pause'))
+})
+
 ok('improvementHints: repeated gaps, no-verify loop, revision classification', () => {
   const repeated = audit.improvementHints(audit.summarizeAudit([
     { ts: 't1', kind: 'verify' },
@@ -923,6 +957,45 @@ if (plugin !== undefined) {
     assert.ok((await report).text.includes('测量报告'))
     assert.ok((await report).text.includes('sess-audit'))
   })
+
+  await okAsync('/loop report memoryJoin: default OFF even with .loop-memory present; ON joins lessons read-only', async () => {
+    const { mkdir, writeFile } = await import('node:fs/promises')
+    // seed a .loop-memory/ with one session lesson for a dedicated session id
+    const memSessionId = 'sess-mjoin'
+    const memDir = joinPath(tmpRoot, '.loop-memory')
+    await mkdir(joinPath(memDir, 'sessions'), { recursive: true })
+    await writeFile(joinPath(memDir, 'sessions', `${memSessionId}.jsonl`),
+      JSON.stringify({ ts: '2026-11-07T10:30:00.000Z', kind: 'lesson', ns: `session(${memSessionId})`, role: 'controller', id: 'm-1', text: 'verify before pause', data: { verdict: 'met', round: 1, gap: '', fix: 'rerun tests' } }) + '\n', 'utf8')
+    await audit.appendAudit(tmpRoot, memSessionId, { ts: '2026-11-07T10:00:00.000Z', kind: 'mode', on: true })
+    const session = { id: memSessionId, __folded: { loopMode: { override: true } } }
+    // default config: memoryJoin OFF → no join section even though the dir exists
+    const offHost = makeHost()
+    plugin.apply(offHost.ctx, {})
+    const offReport = await host0Report(offHost, session)
+    assert.ok(offReport.includes('测量报告'))
+    assert.ok(!offReport.includes('记忆教训'), 'memoryJoin must default OFF')
+    assert.ok(!offReport.includes('verify before pause'))
+    // Config declares the memoryJoin field (volatile)
+    let dump = ''
+    try { dump = JSON.stringify(plugin.Config) } catch { /* meta inspection below */ }
+    assert.ok(plugin.Config?.meta?.properties?.memoryJoin !== undefined || dump.includes('"memoryJoin"'))
+    // memoryJoin: true → the lesson joins, appended after the measurement
+    const onHost = makeHost()
+    plugin.apply(onHost.ctx, { memoryJoin: true })
+    const onReport = await host0Report(onHost, session)
+    assert.ok(onReport.includes('记忆教训 join（loop-memory，只读）'))
+    assert.ok(onReport.includes('verify before pause'))
+    assert.ok(onReport.includes('verdict=met'))
+    assert.ok(onReport.indexOf('测量报告') < onReport.indexOf('记忆教训'), 'join section appends after the measurement')
+  }).finally(() => { /* tmpRoot cleanup is the OS temp dir's job */ })
+
+  /** Invoke /loop report via a host's registered command handler. */
+  async function host0Report(host, session) {
+    const handler = host.state.commands[0].handler
+    const result = await handler({ agent: { session }, rawInput: 'report' })
+    assert.equal(result.kind, 'success')
+    return result.text
+  }
 
   plugin.setModeAppenderForTest(undefined)
 }
