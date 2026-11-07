@@ -5,11 +5,13 @@
   "private": false,
   "type": "module",
   "main": "src/index.ts",
+  "icon": "./icon.png",
   "files": [
     "src",
     "lib",
     "test",
     "presets",
+    "icon.png",
     "cordis.patch.yml",
     "README.md"
   ],

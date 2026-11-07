@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/icon.png" width="160" alt="dsh-loop-mode icon"/>
+<img src="icon.png" width="160" alt="dsh-loop-mode icon"/>
 
 # dsh-loop-mode
 
@@ -119,4 +119,4 @@ node test/client-smoke.mjs  # 5 项：客户端设置卡片接线
 
 ## 许可
 
-MIT。图标位于 `docs/icon.png`。
+MIT。图标位于 `icon.png`（package.json 的 `"icon"` 字段同时供 DSH 插件页显示）。
