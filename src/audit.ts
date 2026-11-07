@@ -112,7 +112,7 @@ export function parseStructuredResult(content: unknown): Record<string, unknown>
 /** Aggregated measurement for one session. */
 export interface AuditSummary {
   window: { first: string | null; last: string | null; modeFlips: number }
-  goals: { created: number; revisions: number; reviseReasons: string[]; finalPhases: Record<string, number> }
+  goals: { created: number; revisions: number; reviseCorrections: number; reviseAdvances: number; reviseUnclassified: number; reviseReasons: string[]; finalPhases: Record<string, number> }
   rounds: { driven: number; byGoal: Record<string, number> }
   tasks: { launched: number; routes: Record<string, number>; settled: number }
   verifies: { launched: number; quick: number; full: number; verdicts: number; met: number; failed: number; unparsed: number; goalQuestionable: number; gaps: string[] }
@@ -123,7 +123,7 @@ export interface AuditSummary {
 export function summarizeAudit(events: AuditEvent[]): AuditSummary {
   const summary: AuditSummary = {
     window: { first: null, last: null, modeFlips: 0 },
-    goals: { created: 0, revisions: 0, reviseReasons: [], finalPhases: {} },
+    goals: { created: 0, revisions: 0, reviseCorrections: 0, reviseAdvances: 0, reviseUnclassified: 0, reviseReasons: [], finalPhases: {} },
     rounds: { driven: 0, byGoal: {} },
     tasks: { launched: 0, routes: {}, settled: 0 },
     verifies: { launched: 0, quick: 0, full: 0, verdicts: 0, met: 0, failed: 0, unparsed: 0, goalQuestionable: 0, gaps: [] },
@@ -186,6 +186,14 @@ export function summarizeAudit(events: AuditEvent[]): AuditSummary {
       }
       case 'revise':
         summary.goals.revisions++
+        // Classification (measurement calibration): a revision over a PAUSED
+        // outgoing goal is the met→pause phase advance ("goal achieved, user
+        // drives the next phase"); anything else is a mid-course correction
+        // (the definition-debt signal). Records predating the field count as
+        // unclassified.
+        if (event.outgoingPhase === 'paused') summary.goals.reviseAdvances++
+        else if (typeof event.outgoingPhase === 'string') summary.goals.reviseCorrections++
+        else summary.goals.reviseUnclassified++
         if (typeof event.reason === 'string' && event.reason.length > 0) summary.goals.reviseReasons.push(event.reason)
         break
       case 'deny': {
@@ -223,8 +231,11 @@ export function improvementHints(summary: AuditSummary): string[] {
   if (summary.rounds.driven > 0 && summary.verifies.verdicts === 0) {
     hints.push('平台已驱动多轮但没有任何独立验收——协议没有走到 MEASURE 环节。')
   }
-  if (summary.goals.revisions >= 3) {
-    hints.push(`目标修订 ${summary.goals.revisions} 次——初始目标可能定义不足（验收标准先行可以减少修订）。`)
+  if (summary.goals.reviseCorrections >= 3) {
+    hints.push(`目标矫正修订 ${summary.goals.reviseCorrections} 次——初始目标可能定义不足（验收标准先行可以减少矫正）。`)
+  }
+  if (summary.verifies.verdicts >= 3 && summary.verifies.met === summary.verifies.verdicts && summary.goals.reviseCorrections === 0 && summary.tasks.launched > 0) {
+    hints.push(`验收 ${summary.verifies.met}/${summary.verifies.verdicts} 全过且零矫正——回路很顺，但若这成为常态，检查验收标准是否偏软（gaps 是否只有化妆级问题）。`)
   }
   return hints
 }
@@ -241,7 +252,7 @@ export function renderReport(summary: AuditSummary, filePath: string): string {
   const lines: string[] = [
     'loop 模式测量报告（本会话审计聚合）',
     `- 时间窗：${summary.window.first ?? '—'} → ${summary.window.last ?? '—'}；模式开关 ${summary.window.modeFlips} 次`,
-    `- goal：创建 ${summary.goals.created}、修订 ${summary.goals.revisions}${summary.goals.reviseReasons.length > 0 ? `（${summary.goals.reviseReasons.map((r) => preview(r, 30)).join('；')}）` : ''}、终态分布 ${JSON.stringify(summary.goals.finalPhases)}`,
+    `- goal：创建 ${summary.goals.created}、修订 ${summary.goals.revisions}（矫正 ${summary.goals.reviseCorrections} / 阶段推进 ${summary.goals.reviseAdvances}${summary.goals.reviseUnclassified > 0 ? ` / 未分类 ${summary.goals.reviseUnclassified}` : ''}）${summary.goals.reviseReasons.length > 0 ? `（${summary.goals.reviseReasons.map((r) => preview(r, 30)).join('；')}）` : ''}、终态分布 ${JSON.stringify(summary.goals.finalPhases)}`,
     `- 平台驱动轮次：${summary.rounds.driven}${Object.keys(summary.rounds.byGoal).length > 0 ? `（按 goal：${Object.entries(summary.rounds.byGoal).map(([g, n]) => `${preview(g, 12)}×${n}`).join('、')}）` : ''}`,
     `- task 委派：${summary.tasks.launched} 次（路由：${Object.entries(summary.tasks.routes).map(([r, n]) => `${r}×${n}`).join('、') || '—'}），结算 ${summary.tasks.settled} 次`,
     `- 独立验收：quick ${summary.verifies.quick} 次 + full ${fullRounds} 轮全量评审（${summary.verifies.full} 方向启动）、${summary.verifies.verdicts} 份 verdict——met ${summary.verifies.met} / fail ${summary.verifies.failed}（通过率 ${pct}）${summary.verifies.unparsed > 0 ? `、异常结束 ${summary.verifies.unparsed}（未产出 verdict，不计入通过率）` : ''}，goalQuestionable ${summary.verifies.goalQuestionable}`,

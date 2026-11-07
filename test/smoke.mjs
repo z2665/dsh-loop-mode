@@ -197,7 +197,8 @@ ok('summarizeAudit aggregates the full chain', () => {
     { ts: 't8', kind: 'deny', tool: 'edit' },
     { ts: 't8b', kind: 'deny', tool: 'edit' },
     { ts: 't9', kind: 'deny', tool: 'edit' },
-    { ts: 't10', kind: 'revise', reason: 'narrowed' },
+    { ts: 't10', kind: 'revise', reason: 'narrowed', outgoingPhase: 'active' },
+    { ts: 't10b', kind: 'revise', reason: 'phase two', outgoingPhase: 'paused' },
     { ts: 't11', kind: 'goal', operation: 'clear', id: 'g1' },
     { ts: 't12', kind: 'goal', operation: 'create', id: 'g2', revision: 1, phase: 'active' },
     { ts: 't13', kind: 'round', goalId: 'g2', round: 1 },
@@ -208,7 +209,9 @@ ok('summarizeAudit aggregates the full chain', () => {
   const s = audit.summarizeAudit(events)
   assert.equal(s.window.modeFlips, 1)
   assert.equal(s.goals.created, 2)
-  assert.equal(s.goals.revisions, 1)
+  assert.equal(s.goals.revisions, 2)
+  assert.equal(s.goals.reviseCorrections, 1)
+  assert.equal(s.goals.reviseAdvances, 1)
   assert.deepEqual(s.goals.finalPhases, { paused: 1 }) // g1 cleared, g2 paused
   assert.equal(s.rounds.driven, 2)
   assert.equal(s.tasks.launched, 1)
@@ -226,7 +229,7 @@ ok('summarizeAudit aggregates the full chain', () => {
   assert.ok(report.includes('/tmp/x.jsonl'))
 })
 
-ok('improvementHints: repeated gaps and no-verify loop', () => {
+ok('improvementHints: repeated gaps, no-verify loop, revision classification', () => {
   const repeated = audit.improvementHints(audit.summarizeAudit([
     { ts: 't1', kind: 'verify' },
     { ts: 't2', kind: 'verdict', met: true, gaps: ['same gap'] },
@@ -239,6 +242,32 @@ ok('improvementHints: repeated gaps and no-verify loop', () => {
     { ts: 't2', kind: 'round', goalId: 'g1', round: 2 },
   ]))
   assert.ok(noVerify.some((h) => h.includes('没有走到 MEASURE')))
+  // phase-advance revisions (paused outgoing) are NOT definition debt
+  const advances = audit.improvementHints(audit.summarizeAudit([
+    { ts: 't1', kind: 'revise', outgoingPhase: 'paused', reason: 'done, next phase' },
+    { ts: 't2', kind: 'revise', outgoingPhase: 'paused', reason: 'done, next' },
+    { ts: 't3', kind: 'revise', outgoingPhase: 'paused', reason: 'done, next' },
+    { ts: 't4', kind: 'revise', outgoingPhase: 'paused', reason: 'done, next' },
+  ]))
+  assert.ok(!advances.some((h) => h.includes('初始目标可能定义不足')))
+  // mid-course corrections ARE definition debt
+  const corrections = audit.improvementHints(audit.summarizeAudit([
+    { ts: 't1', kind: 'revise', outgoingPhase: 'active', reason: 'scope wrong' },
+    { ts: 't2', kind: 'revise', outgoingPhase: 'active', reason: 'scope wrong' },
+    { ts: 't3', kind: 'revise', outgoingPhase: 'blocked', reason: 'scope wrong' },
+  ]))
+  assert.ok(corrections.some((h) => h.includes('矫正修订 3 次')))
+  // all-met + zero corrections → soft-criteria probe
+  const soft = audit.improvementHints(audit.summarizeAudit([
+    { ts: 't1', kind: 'task' },
+    { ts: 't2', kind: 'verify', mode: 'full' },
+    { ts: 't3', kind: 'verify', mode: 'full' },
+    { ts: 't4', kind: 'verify', mode: 'full' },
+    { ts: 't5', kind: 'verdict', met: true, gaps: [] },
+    { ts: 't6', kind: 'verdict', met: true, gaps: [] },
+    { ts: 't7', kind: 'verdict', met: true, gaps: [] },
+  ]))
+  assert.ok(soft.some((h) => h.includes('验收标准是否偏软')))
 })
 
 // ---------------------------------------------------------------------------
@@ -644,7 +673,7 @@ if (plugin !== undefined) {
   await okAsync('loop_revise: clear→create→audit, reason required', async () => {
     const host = makeHost()
     plugin.apply(host.ctx, {})
-    const agent = { session: { __folded: {} } }
+    const agent = { session: { id: 'sess-revise2', __folded: {} } }
     const revise = tool(host, 'loop_revise')
     await assert.rejects(revise.execute({ objective: 'new' }, { agent }), /reason is required/)
     const result = await revise.execute({ reason: 'narrowed', objective: 'new objective' }, { agent })
@@ -655,6 +684,11 @@ if (plugin !== undefined) {
     ])
     assert.equal(events.at(-1).type, 'plugin:loop-mode/revise')
     assert.equal(events.at(-1).data.from.id, 'g-old')
+    // the audit trail classifies the revision: active outgoing goal → correction
+    await sleep(50)
+    const reviseRecords = (await audit.readAudit(tmpRoot, 'sess-revise2')).filter((e) => e.kind === 'revise')
+    assert.equal(reviseRecords.length, 1)
+    assert.equal(reviseRecords[0].outgoingPhase, 'active')
   })
 
   await okAsync('loop_pause / loop_resume: lifecycle verbs for the auto-round driver', async () => {

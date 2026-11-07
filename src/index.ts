@@ -389,10 +389,9 @@ export function apply(ctx: any, config: Partial<Config> = {}) {
     safePush(dispatchDisposer)
 
     // --- settlement classification helpers (observability) --------------------
-    /** ChildIds already recorded from a settlement — an inbox message fires
-     * agent/inbox/inserted again on every relocation (nextTurn → nextStep),
-     * and the rebuild path would happily re-record each copy (observed live:
-     * one settlement produced several duplicate records). */
+    /** ChildIds already recorded from a settlement — idempotence guard: an
+     * inbox message can legitimately fire agent/inbox/inserted again on
+     * relocation (nextTurn → nextStep), and each copy would re-record. */
     const settledChildIds = new Set<string>()
     /** Record one child settlement: verdict when parseable, else explicit. */
     const recordSettlement = (
@@ -697,7 +696,15 @@ export function apply(ctx: any, config: Partial<Config> = {}) {
           // surface it loudly rather than losing the revision silently.
           throw new Error(`loop_revise: goal replaced (${from?.id ?? '∅'} → ${created.id}) but the audit event failed: ${String(error)}`)
         }
-        audit(parent.session, 'revise', { from: from?.id ?? null, to: created.id, reason: preview(reason, 100) })
+        // outgoingPhase classifies the revision in the measurement layer: a
+        // paused outgoing goal is the met→pause progression (phase advance);
+        // an active/blocked one is a mid-course correction.
+        audit(parent.session, 'revise', {
+          from: from?.id ?? null,
+          to: created.id,
+          outgoingPhase: from !== null && current !== undefined && current !== null && typeof current.phase === 'string' ? current.phase : null,
+          reason: preview(reason, 100),
+        })
         return {
           text:
             `goal 修订完成：${from !== null ? `${from.id} → 墓穴` : '（无前序 goal）'} 新 goal ${created.id}（objective 已更新，轮上限 ${cap}）。` +
