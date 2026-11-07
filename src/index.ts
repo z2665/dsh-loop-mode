@@ -40,11 +40,12 @@ import {
 import {
   REVISE_EVENT_TYPE, revisionsProjection, revisionsOf,
   VERIFY_EVENT_TYPE, verifyLedgerProjection, quickSpentOf,
+  DELEGATION_EVENT_TYPE, delegationsProjection,
 } from './goals.ts'
 import {
   resolveGateAllowlist, buildGuidance, buildVerifierPrompt, buildFullReviewPrompts, REVIEW_DIRECTIONS,
   VERDICT_SCHEMA, filterAssemblyTools, stripPluginTools, isDeniedByGate, isPluginTool, isTopLevel,
-  fenceField, fenceNonce, TASK_PREAMBLE,
+  fenceField, fenceNonce, roleMarkerLine, TASK_PREAMBLE,
 } from './protocol.ts'
 import {
   parseModelSpec, agentOptionsFor, formatRoute, validateModelRoute,
@@ -291,6 +292,9 @@ export function apply(ctx: any, config: Partial<Config> = {}) {
     registerProjection(loopModeProjection())
     registerProjection(revisionsProjection())
     registerProjection(verifyLedgerProjection())
+    // Cross-plugin delegation identity (dsh-loop-memory design §3-②'): folded
+    // childId→role map queried by other plugins via sessionProjections.stateOf.
+    registerProjection(delegationsProjection())
   }
 
   // --- guidance section: the loop protocol, per-session mode-gated ----------
@@ -563,11 +567,27 @@ export function apply(ctx: any, config: Partial<Config> = {}) {
             ? 'loop_task: no fresh-context subagent provider with agentOptions capability is registered (set config delegateProvider explicitly)'
             : 'loop_task: no fresh-context subagent provider is registered (set config delegateProvider explicitly)')
         }
+        // Delegation identity (dsh-loop-memory design §3-②'): the prompt's
+        // FIRST line is the stable role marker; the same nonce rides the
+        // declared/launched session-log records, so a whitelist plugin can
+        // bind "this child ← this role" via the parent's tamper-resistant
+        // session log (the marker alone, copied elsewhere, grants nothing).
+        const nonce = fenceNonce()
         const prompt =
+          `${roleMarkerLine('executor', nonce)}\n\n` +
           'TASK BRIEF — you are a task executor in a cybernetics control loop. You have NO conversation ' +
           'history: this brief is everything you know. Deliver the work it orders and report the outcome ' +
           'with concrete evidence.\n\n' +
           `${TASK_PREAMBLE}\n\n${fenceField('WORK ORDER', brief, fenceNonce())}`
+        // Pre-declare BEFORE startActivation: the child's agent/created
+        // publication fires inside the call (before childId is known), so
+        // this record is the only role signal queryable at restrict time.
+        // Best-effort — on failure the child is treated as unidentified
+        // (fail-closed upstream); the launch itself proceeds.
+        if (typeof modeAppender !== 'function') kickAppenderLoad()
+        try {
+          modeAppender?.(parent.session, DELEGATION_EVENT_TYPE, { phase: 'declared', role: 'executor', nonce })
+        } catch { /* ledger degraded, launch proceeds */ }
         const activation = await subagents.startActivation({
           provider: providerName,
           label: description.length > 0 ? description : 'loop task',
@@ -579,6 +599,12 @@ export function apply(ctx: any, config: Partial<Config> = {}) {
           signal: exec?.signal,
           delivery: 'parent',
         })
+        // Settle the declaration into the authoritative childId→role map.
+        try {
+          modeAppender?.(parent.session, DELEGATION_EVENT_TYPE, {
+            phase: 'launched', role: 'executor', nonce, childId: activation.childId, at: new Date().toISOString(),
+          })
+        } catch { /* in-memory correlation + audit below still record */ }
         childRoles.set(activation.childId, { role: 'task', tier, sessionId: sessionIdOf(parent.session) ?? '' })
         audit(parent.session, 'task', {
           childId: activation.childId,
@@ -805,11 +831,20 @@ export function apply(ctx: any, config: Partial<Config> = {}) {
         }
         const routeText = formatRoute(route, readConfigField(config.verifyEffort, ''))
         const launch = async (label: string, prompt: string) => {
+          // Verifier delegation identity — same shape as loop_task above: the
+          // stable role marker rides the prompt's first line, and the
+          // declared/launched session-log records (same nonce) carry the
+          // authoritative childId→role mapping for whitelist plugins.
+          const nonce = fenceNonce()
+          if (typeof modeAppender !== 'function') kickAppenderLoad()
+          try {
+            modeAppender?.(parent.session, DELEGATION_EVENT_TYPE, { phase: 'declared', role: 'verifier', nonce })
+          } catch { /* ledger degraded, launch proceeds */ }
           const activation = await subagents.startActivation({
             provider: providerName,
             label,
             request: {
-              prompt: [{ type: 'text', text: prompt }],
+              prompt: [{ type: 'text', text: `${roleMarkerLine('verifier', nonce)}\n\n${prompt}` }],
               parent,
               outputSchema: VERDICT_SCHEMA,
               ...agentOptions === undefined ? {} : { agentOptions },
@@ -817,6 +852,11 @@ export function apply(ctx: any, config: Partial<Config> = {}) {
             signal: exec?.signal,
             delivery: 'parent',
           })
+          try {
+            modeAppender?.(parent.session, DELEGATION_EVENT_TYPE, {
+              phase: 'launched', role: 'verifier', nonce, childId: activation.childId, at: new Date().toISOString(),
+            })
+          } catch { /* pacing ledger + audit below still record */ }
           return activation.childId as string
         }
         if (mode === 'full') {

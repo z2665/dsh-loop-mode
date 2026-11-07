@@ -103,6 +103,55 @@ ok('revisionsOf reads the chain; failures resolve to empty', () => {
   assert.equal(goals.revisionsOf({}, session).count, 0)
 })
 
+ok('delegations projection: declared queues, launched consumes + maps childId', () => {
+  const p = goals.delegationsProjection()
+  let s = p.init({}, 0)
+  assert.deepEqual(s, { pending: [], children: {} })
+  s = p.apply(s, { type: goals.DELEGATION_EVENT_TYPE, data: { phase: 'declared', role: 'executor', nonce: 'n1' } })
+  assert.deepEqual(s.pending, [{ role: 'executor', nonce: 'n1' }])
+  // duplicate declaration is idempotent
+  s = p.apply(s, { type: goals.DELEGATION_EVENT_TYPE, data: { phase: 'declared', role: 'executor', nonce: 'n1' } })
+  assert.equal(s.pending.length, 1)
+  s = p.apply(s, { type: goals.DELEGATION_EVENT_TYPE, data: { phase: 'launched', role: 'executor', nonce: 'n1', childId: 'c1', at: 't1' } })
+  assert.deepEqual(s.pending, [])
+  assert.deepEqual(s.children.c1, { role: 'executor', nonce: 'n1', at: 't1' })
+  // launched without a matching declaration still registers the child (replay trimming)
+  s = p.apply(s, { type: goals.DELEGATION_EVENT_TYPE, data: { phase: 'launched', role: 'verifier', nonce: 'nX', childId: 'c2', at: 't2' } })
+  assert.equal(s.children.c2.role, 'verifier')
+  // garbage: bad role / nonce / childId / phase skipped
+  s = p.apply(s, { type: goals.DELEGATION_EVENT_TYPE, data: { phase: 'declared', role: 'admin', nonce: 'n' } })
+  s = p.apply(s, { type: goals.DELEGATION_EVENT_TYPE, data: { phase: 'declared', role: 'verifier', nonce: '' } })
+  s = p.apply(s, { type: goals.DELEGATION_EVENT_TYPE, data: { phase: 'launched', role: 'verifier', nonce: 'ok', childId: 42 } })
+  s = p.apply(s, { type: goals.DELEGATION_EVENT_TYPE, data: { phase: 'mystery', role: 'verifier', nonce: 'ok' } })
+  s = p.apply(s, { type: 'other', data: {} })
+  assert.equal(s.pending.length, 0)
+  assert.equal(Object.keys(s.children).length, 2)
+})
+
+ok('delegations projection: pending capped; children capped (oldest evicted)', () => {
+  const p = goals.delegationsProjection()
+  let s = p.init({}, 0)
+  for (let i = 0; i < 24; i++) {
+    s = p.apply(s, { type: goals.DELEGATION_EVENT_TYPE, data: { phase: 'declared', role: 'executor', nonce: `n${i}` } })
+  }
+  assert.equal(s.pending.length, 16) // cap keeps the NEWEST declarations
+  assert.deepEqual(s.pending.at(-1), { role: 'executor', nonce: 'n23' })
+  for (let i = 0; i < 300; i++) {
+    s = p.apply(s, { type: goals.DELEGATION_EVENT_TYPE, data: { phase: 'launched', role: 'verifier', nonce: `v${i}`, childId: `c${i}` } })
+  }
+  assert.equal(Object.keys(s.children).length, 256)
+  assert.equal(s.children.c0, undefined) // oldest evicted
+  assert.ok(s.children.c299 !== undefined)
+})
+
+ok('delegationsOf reads the ledger; failures resolve to empty', () => {
+  const session = { __folded: { [goals.DELEGATIONS_PROJECTION_KEY]: { pending: [], children: { c1: { role: 'executor', nonce: 'n', at: '' } } } } }
+  assert.equal(goals.delegationsOf(registryFor(), session).children.c1.role, 'executor')
+  assert.deepEqual(goals.delegationsOf(registryFor(), {}), { pending: [], children: {} })
+  assert.deepEqual(goals.delegationsOf(registryFor(), { __folded: { loopDelegations: { pending: 'x', children: null } } }), { pending: [], children: {} })
+  assert.deepEqual(goals.delegationsOf({}, session), { pending: [], children: {} })
+})
+
 // ---------------------------------------------------------------------------
 console.log('# routes.ts (per-role model routing)')
 const routes = await import('../src/routes.ts')
@@ -349,6 +398,26 @@ ok('isTopLevel: roots, fallback, children', () => {
   assert.equal(protocol.isTopLevel({}, undefined), false)
 })
 
+ok('role marker line: stable syntax, roundtrip, whole-line exact match only', () => {
+  const line = protocol.roleMarkerLine('executor', 'abc123')
+  assert.equal(line, '[dsh-loop-mode:role executor nonce=abc123]')
+  assert.deepEqual(protocol.parseRoleMarkerLine(line), { role: 'executor', nonce: 'abc123' })
+  assert.deepEqual(protocol.parseRoleMarkerLine(protocol.roleMarkerLine('verifier', 'zz9')), { role: 'verifier', nonce: 'zz9' })
+  // forged/malformed lines never parse
+  assert.equal(protocol.parseRoleMarkerLine('[dsh-loop-mode:role controller nonce=x]'), null) // no such delegation role
+  assert.equal(protocol.parseRoleMarkerLine('[dsh-loop-mode:role executor nonce=]'), null)
+  assert.equal(protocol.parseRoleMarkerLine('[dsh-loop-mode:role executor]'), null)
+  assert.equal(protocol.parseRoleMarkerLine('text [dsh-loop-mode:role executor nonce=x] more'), null) // mid-text
+  assert.equal(protocol.parseRoleMarkerLine('  [dsh-loop-mode:role executor nonce=x]'), null) // leading space
+  assert.equal(protocol.parseRoleMarkerLine('[dsh-loop-mode:role executor nonce=x]\nsecond line'), null) // multi-line
+  assert.equal(protocol.parseRoleMarkerLine(undefined), null)
+  // distinct launches carry distinct nonces (fenceNonce reuse)
+  assert.notEqual(
+    protocol.parseRoleMarkerLine(protocol.roleMarkerLine('executor', protocol.fenceNonce()))?.nonce,
+    protocol.parseRoleMarkerLine(protocol.roleMarkerLine('executor', protocol.fenceNonce()))?.nonce,
+  )
+})
+
 // ---------------------------------------------------------------------------
 console.log('# index.ts (wiring; requires @deepseek-ai/schemastery)')
 let plugin
@@ -425,7 +494,10 @@ if (plugin !== undefined) {
     const host = makeHost()
     const teardown = plugin.apply(host.ctx, {})
     assert.equal(typeof teardown, 'function')
-    assert.deepEqual(host.state.projections.map((p) => p.key).sort(), ['loopMode', 'loopRevisions', 'loopVerifyLedger'])
+    assert.deepEqual(
+      host.state.projections.map((p) => p.key).sort(),
+      ['loopDelegations', 'loopMode', 'loopRevisions', 'loopVerifyLedger'],
+    )
     assert.equal(host.state.commands[0].name, 'loop')
     assert.deepEqual(host.state.tools.map((t) => t.name).sort(), ['loop_pause', 'loop_resume', 'loop_revise', 'loop_task', 'loop_verify'])
     assert.ok(host.state.listeners['system-prompt/assemble']?.length >= 1)
@@ -582,6 +654,50 @@ if (plugin !== undefined) {
     assert.deepEqual(verdicts.map((v) => v.direction).sort(), ['architecture', 'quality', 'security'])
     const verifyEvents = events.filter((e) => e.kind === 'verify')
     assert.equal(verifyEvents.filter((e) => e.mode === 'full').length, 3)
+  })
+
+  await okAsync('delegation identity: marker first line; declared→activation→launched ordering', async () => {
+    const host = makeHost()
+    // Interleave activation calls into the appender event stream to prove the
+    // session-log ordering a whitelist plugin depends on. Slice from this
+    // test's start: the events array is shared across the whole suite.
+    const eventsFrom = events.length
+    host.ctx.subagents.startActivation = async (spec) => {
+      events.push({ type: 'test:activation-called', data: { label: spec.label } })
+      host.state.activations.push(spec)
+      return { childId: `child-${host.state.activations.length}` }
+    }
+    plugin.apply(host.ctx, {})
+    const agent = { session: { id: 'sess-deleg', __folded: { loopMode: { override: true } } } }
+    await tool(host, 'loop_task').execute({ description: 'd', brief: 'B' }, { agent })
+    const own = () => events.slice(eventsFrom)
+    const taskPrompt = host.state.activations[0].request.prompt[0].text
+    const firstLine = taskPrompt.split('\n')[0]
+    const taskNonce = protocol.parseRoleMarkerLine(firstLine)?.nonce
+    assert.ok(taskNonce !== undefined, 'loop_task prompt must open with a parseable role marker')
+    assert.ok(taskPrompt.includes('TASK BRIEF'))
+    const i0 = own().findIndex((e) => e.type === 'plugin:loop-mode/delegation' && e.data.phase === 'declared' && e.data.role === 'executor' && e.data.nonce === taskNonce)
+    const iAct = own().findIndex((e) => e.type === 'test:activation-called')
+    const i1 = own().findIndex((e) => e.type === 'plugin:loop-mode/delegation' && e.data.phase === 'launched' && e.data.role === 'executor' && e.data.nonce === taskNonce && e.data.childId === 'child-1')
+    assert.ok(i0 !== -1 && iAct !== -1 && i1 !== -1, 'delegation records must exist')
+    assert.ok(i0 < iAct && iAct < i1, 'declared precedes startActivation; launched follows it')
+    // verifier side: quick + full prompts both carry the verifier marker
+    await tool(host, 'loop_verify').execute({ criteria: 'C', deliverable: 'D' }, { agent })
+    await tool(host, 'loop_verify').execute({ mode: 'full', criteria: 'C', deliverable: 'D' }, { agent })
+    for (const spec of host.state.activations.slice(1)) {
+      const m = protocol.parseRoleMarkerLine(spec.request.prompt[0].text.split('\n')[0])
+      assert.deepEqual(m?.role, 'verifier')
+      assert.ok(spec.request.prompt[0].text.includes('INDEPENDENT'))
+    }
+    const verifierLaunched = own().filter((e) => e.type === 'plugin:loop-mode/delegation' && e.data.phase === 'launched' && e.data.role === 'verifier')
+    // 1 quick + 3 full-direction launches
+    assert.deepEqual(verifierLaunched.map((e) => e.data.childId), ['child-2', 'child-3', 'child-4', 'child-5'])
+    // every launched nonce matches its prompt marker nonce (binding)
+    for (let i = 1; i < host.state.activations.length; i++) {
+      const spec = host.state.activations[i]
+      const nonce = protocol.parseRoleMarkerLine(spec.request.prompt[0].text.split('\n')[0])?.nonce
+      assert.equal(verifierLaunched[i - 1].data.nonce, nonce)
+    }
   })
 
   await okAsync('guidance carries the tiered-verification pacing rule', () => {
