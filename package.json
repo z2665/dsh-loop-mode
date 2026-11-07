@@ -1,6 +1,6 @@
 {
   "name": "dsh-loop-mode",
-  "version": "0.7.3",
+  "version": "0.8.0",
   "license": "MIT",
   "private": false,
   "type": "module",
@@ -32,6 +32,7 @@
     },
     "client": {
       "inject": [
+        "@deepseek-ai/dsh-api-session-controller",
         "@deepseek-ai/dsh-client-locale",
         "@deepseek-ai/dsh-client-ui-renderer",
         "@deepseek-ai/dsh-client-ui-settings"

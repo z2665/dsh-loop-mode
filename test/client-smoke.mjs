@@ -56,12 +56,11 @@ const client = loaded[0].factory(fakeRequire)
 
 ok('exports { name, inject, apply } with the client service injects', () => {
   assert.equal(client.name, 'dsh-loop-mode')
-  assert.deepEqual([...client.inject].sort(), ['configForms', 'locale', 'slots'])
+  assert.deepEqual([...client.inject].sort(), ['configForms', 'locale', 'remote', 'remote.session', 'slots'])
   assert.equal(typeof client.apply, 'function')
 })
 
 const registered = { locale: null, seats: [] }
-
 ok('apply registers locale dictionaries (zh/en) and all three seats', () => {
   // The real slots API: ctx.slots.inject(seat, factory) where factory()
   // returns ctx.slots.register(def, Component) — emulate by calling the
@@ -97,7 +96,61 @@ ok('apply registers locale dictionaries (zh/en) and all three seats', () => {
 ok('the plugins.item inject supplies the bound ConfigForm', () => {
   const seat = registered.seats.find((s) => s.def.name === 'plugins.item')
   const props = seat.def.inject()
-  assert.deepEqual(props, { form: { fake: 'form', id: 'dsh-loop-mode' } })
+  assert.deepEqual(props, { form: { fake: 'form', id: 'dsh-loop-mode' }, catalog: undefined })
+})
+
+ok('inject declares the catalog namespaces (remote, remote.session)', () => {
+  assert.deepEqual([...client.inject].sort(), ['configForms', 'locale', 'remote', 'remote.session', 'slots'])
+})
+
+await okAsync('catalog store: loads groups into options; handles failure; notifies subscribers', async () => {
+  const store = client.createModelCatalogStore()
+  assert.equal(store.getSnapshot().status, 'idle')
+  const seen = []
+  store.subscribe(() => seen.push(store.getSnapshot().status))
+  await store.load({
+    modelCatalog: async () => ({
+      ok: true,
+      value: { groups: [
+        { id: 'p1', name: 'Provider One', models: [
+          { id: 'm1', name: 'M One', reasoning: { efforts: [{ id: 'low' }, { id: 'high', name: 'High' }], defaultEffort: 'high' } },
+          { id: 'm2', name: 'M Two' },
+        ] },
+        { id: 'p2', name: 'P Two', models: [{ id: 'm1', name: 'dup id' }] },
+      ] },
+    }),
+  })
+  const snap = store.getSnapshot()
+  assert.equal(snap.status, 'ready')
+  assert.equal(snap.options.length, 3)
+  assert.deepEqual(snap.options[0], {
+    value: 'p1/m1', provider: 'p1', model: 'm1',
+    reasoning: { efforts: [{ id: 'low' }, { id: 'high', name: 'High' }], defaultEffort: 'high' },
+    label: 'Provider One · p1/m1',
+  })
+  assert.ok(seen.includes('loading') && seen.includes('ready'))
+  // failure path
+  await store.load({ modelCatalog: async () => { throw new Error('boom') } })
+  assert.equal(store.getSnapshot().status, 'error')
+  assert.equal(store.getSnapshot().options.length, 0)
+})
+
+ok('availability + effort helpers', () => {
+  const snap = { status: 'ready', options: [
+    { value: 'p1/m1', provider: 'p1', model: 'm1', reasoning: { efforts: [{ id: 'low' }, { id: 'high' }], defaultEffort: 'high' }, label: 'x' },
+    { value: 'p2/m2', provider: 'p2', model: 'm2', label: 'y' },
+  ] }
+  assert.equal(client.isConfiguredModelAvailable('', snap), true)
+  assert.equal(client.isConfiguredModelAvailable('p1/m1', snap), true)
+  assert.equal(client.isConfiguredModelAvailable('m2', snap), true)
+  assert.equal(client.isConfiguredModelAvailable('p9/m9', snap), false)
+  assert.equal(client.isConfiguredModelAvailable('p1/m1', { status: 'error', options: [] }), true) // unprovable → no flag
+  const opt = client.catalogOptionFor('p1/m1', snap)
+  const rows = client.effortRows(opt)
+  assert.equal(rows.defaultEffort, 'high')
+  assert.deepEqual(rows.efforts.map((e) => e.id), ['low', 'high'])
+  assert.equal(client.effortRows(client.catalogOptionFor('p2/m2', snap)), undefined) // no reasoning declared
+  assert.equal(client.effortRows(undefined), undefined)
 })
 
 await okAsync('every field spec maps to a real volatile Config field', async () => {
