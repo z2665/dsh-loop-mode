@@ -253,9 +253,11 @@ const isDelegationRole = (value: unknown): value is DelegationLedgerRole =>
 /**
  * Fold `plugin:loop-mode/delegation` events: declared pushes onto pending;
  * launched consumes the FIRST pending entry matching {role, nonce} and records
- * the authoritative childId→{role, nonce, at}. A launched record with no
- * matching declaration still registers the child (resume/replay may have
- * trimmed the declared event); malformed records are skipped.
+ * the authoritative childId→{role, nonce, at}; aborted (v0.9.1, review round)
+ * drops the matching pending entry — a launch that failed after its
+ * pre-declaration must not linger in the whitelist window. A launched record
+ * with no matching declaration still registers the child (resume/replay may
+ * have trimmed the declared event); malformed records are skipped.
  */
 export function delegationsProjection(): DelegationsProjectionLike {
   return {
@@ -286,6 +288,11 @@ export function delegationsProjection(): DelegationsProjectionLike {
           for (const [id] of entries.slice(0, entries.length - DELEGATIONS_CHILDREN_CAP)) delete children[id]
         }
         return { pending, children }
+      }
+      if (data.phase === 'aborted') {
+        const index = state.pending.findIndex((p) => p.nonce === nonce && p.role === role)
+        if (index < 0) return state
+        return { pending: state.pending.filter((_, i) => i !== index), children: state.children }
       }
       return state
     },

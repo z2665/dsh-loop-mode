@@ -114,8 +114,8 @@ export interface AuditSummary {
   window: { first: string | null; last: string | null; modeFlips: number }
   goals: { created: number; revisions: number; reviseCorrections: number; reviseAdvances: number; reviseUnclassified: number; reviseReasons: string[]; finalPhases: Record<string, number> }
   rounds: { driven: number; byGoal: Record<string, number> }
-  tasks: { launched: number; routes: Record<string, number>; settled: number }
-  verifies: { launched: number; quick: number; full: number; verdicts: number; met: number; failed: number; unparsed: number; goalQuestionable: number; gaps: string[] }
+  tasks: { launched: number; routes: Record<string, number>; settled: number; fanouts: number; fanFailed: number }
+  verifies: { launched: number; quick: number; full: number; launchFailed: number; verdicts: number; met: number; failed: number; unparsed: number; goalQuestionable: number; gaps: string[] }
   denies: { total: number; byTool: Record<string, number> }
 }
 
@@ -125,11 +125,15 @@ export function summarizeAudit(events: AuditEvent[]): AuditSummary {
     window: { first: null, last: null, modeFlips: 0 },
     goals: { created: 0, revisions: 0, reviseCorrections: 0, reviseAdvances: 0, reviseUnclassified: 0, reviseReasons: [], finalPhases: {} },
     rounds: { driven: 0, byGoal: {} },
-    tasks: { launched: 0, routes: {}, settled: 0 },
-    verifies: { launched: 0, quick: 0, full: 0, verdicts: 0, met: 0, failed: 0, unparsed: 0, goalQuestionable: 0, gaps: [] },
+    tasks: { launched: 0, routes: {}, settled: 0, fanouts: 0, fanFailed: 0 },
+    verifies: { launched: 0, quick: 0, full: 0, launchFailed: 0, verdicts: 0, met: 0, failed: 0, unparsed: 0, goalQuestionable: 0, gaps: [] },
     denies: { total: 0, byTool: {} },
   }
   const goalPhase = new Map<string, string>()
+  // Fan-out measurement: distinct fan groups (one fanId per loop_task tasks[]
+  // call) and per-launch failures, so the report can show concurrency usage
+  // and capacity problems honestly.
+  const fanIds = new Set<string>()
   for (const event of events) {
     if (typeof event.ts === 'string') {
       if (summary.window.first === null) summary.window.first = event.ts
@@ -156,7 +160,16 @@ export function summarizeAudit(events: AuditEvent[]): AuditSummary {
         break
       }
       case 'task': {
+        if (event.failed === true) {
+          // A fan-out direction that never started (capacity, bad directory) —
+          // counted separately, never as a launched round.
+          summary.tasks.fanFailed++
+          break
+        }
         summary.tasks.launched++
+        if (typeof event.fanTotal === 'number' && event.fanTotal > 1 && typeof event.fanId === 'string') {
+          fanIds.add(event.fanId)
+        }
         const route = String(event.route ?? 'inherit')
         summary.tasks.routes[route] = (summary.tasks.routes[route] ?? 0) + 1
         break
@@ -164,11 +177,18 @@ export function summarizeAudit(events: AuditEvent[]): AuditSummary {
       case 'task-settled':
         summary.tasks.settled++
         break
-      case 'verify':
+      case 'verify': {
+        if (event.failed === true) {
+          // A direction reviewer that never started (capacity/admission) —
+          // counted separately, never as a launched review (v0.9.1).
+          summary.verifies.launchFailed++
+          break
+        }
         summary.verifies.launched++
         if (event.mode === 'full') summary.verifies.full++
         else summary.verifies.quick++
         break
+      }
       case 'verify-settled':
         summary.verifies.unparsed++
         break
@@ -209,6 +229,7 @@ export function summarizeAudit(events: AuditEvent[]): AuditSummary {
   for (const phase of goalPhase.values()) {
     summary.goals.finalPhases[phase] = (summary.goals.finalPhases[phase] ?? 0) + 1
   }
+  summary.tasks.fanouts = fanIds.size
   return summary
 }
 
@@ -234,6 +255,12 @@ export function improvementHints(summary: AuditSummary): string[] {
   if (summary.goals.reviseCorrections >= 3) {
     hints.push(`目标矫正修订 ${summary.goals.reviseCorrections} 次——初始目标可能定义不足（验收标准先行可以减少矫正）。`)
   }
+  if (summary.tasks.fanFailed >= 2) {
+    hints.push(`fan-out 启动失败 ${summary.tasks.fanFailed} 次——可能超过宿主活动子代理容量（maxActiveSubagents）或 cwd 无效；缩小 maxFanout、分多轮 fan-out，或检查失败方向的环境配置。`)
+  }
+  if (summary.verifies.launchFailed >= 2) {
+    hints.push(`验收方向启动失败 ${summary.verifies.launchFailed} 次——大概率是活动子代理容量不足（maxActiveSubagents）；等待在跑的子代理结算后再做全量验收，或调高宿主容量。`)
+  }
   if (summary.verifies.verdicts >= 3 && summary.verifies.met === summary.verifies.verdicts && summary.goals.reviseCorrections === 0 && summary.tasks.launched > 0) {
     hints.push(`验收 ${summary.verifies.met}/${summary.verifies.verdicts} 全过且零矫正——回路很顺，但若这成为常态，检查验收标准是否偏软（gaps 是否只有化妆级问题）。`)
   }
@@ -257,8 +284,8 @@ export function renderReport(summary: AuditSummary, filePath: string): string {
     `- 时间窗：${summary.window.first ?? '—'} → ${summary.window.last ?? '—'}；模式开关 ${summary.window.modeFlips} 次`,
     `- goal：创建 ${summary.goals.created}、修订 ${summary.goals.revisions}（矫正 ${summary.goals.reviseCorrections} / 阶段推进 ${summary.goals.reviseAdvances}${summary.goals.reviseUnclassified > 0 ? ` / 未分类 ${summary.goals.reviseUnclassified}` : ''}）${summary.goals.reviseReasons.length > 0 ? `（${summary.goals.reviseReasons.map((r) => preview(r, 30)).join('；')}）` : ''}、终态分布 ${JSON.stringify(summary.goals.finalPhases)}`,
     `- 平台驱动轮次：${summary.rounds.driven}${Object.keys(summary.rounds.byGoal).length > 0 ? `（按 goal：${Object.entries(summary.rounds.byGoal).map(([g, n]) => `${preview(g, 12)}×${n}`).join('、')}）` : ''}`,
-    `- task 委派：${summary.tasks.launched} 次（路由：${Object.entries(summary.tasks.routes).map(([r, n]) => `${r}×${n}`).join('、') || '—'}），结算 ${summary.tasks.settled} 次`,
-    `- 独立验收：quick ${summary.verifies.quick} 次 + full ${fullRounds} 轮全量评审（${summary.verifies.full} 方向启动）、${summary.verifies.verdicts} 份 verdict——met ${summary.verifies.met} / fail ${summary.verifies.failed}（通过率 ${pct}）${summary.verifies.unparsed > 0 ? `、异常结束 ${summary.verifies.unparsed}（未产出 verdict，不计入通过率）` : ''}，goalQuestionable ${summary.verifies.goalQuestionable}`,
+    `- task 委派：${summary.tasks.launched} 次${summary.tasks.fanouts > 0 ? `（含 ${summary.tasks.fanouts} 轮 fan-out 并发）` : ''}（路由：${Object.entries(summary.tasks.routes).map(([r, n]) => `${r}×${n}`).join('、') || '—'}），结算 ${summary.tasks.settled} 次${summary.tasks.fanFailed > 0 ? `，启动失败 ${summary.tasks.fanFailed} 次` : ''}`,
+    `- 独立验收：quick ${summary.verifies.quick} 次 + full ${fullRounds} 轮全量评审（${summary.verifies.full} 方向启动）、${summary.verifies.verdicts} 份 verdict——met ${summary.verifies.met} / fail ${summary.verifies.failed}（通过率 ${pct}）${summary.verifies.unparsed > 0 ? `、异常结束 ${summary.verifies.unparsed}（未产出 verdict，不计入通过率）` : ''}${summary.verifies.launchFailed > 0 ? `、启动失败 ${summary.verifies.launchFailed} 次` : ''}，goalQuestionable ${summary.verifies.goalQuestionable}`,
     `- 硬门拒绝：${summary.denies.total} 次${summary.denies.total > 0 ? `（${Object.entries(summary.denies.byTool).map(([t, n]) => `${t}×${n}`).join('、')}）` : ''}`,
   ]
   const hints = improvementHints(summary)

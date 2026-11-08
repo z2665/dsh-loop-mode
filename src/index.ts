@@ -34,6 +34,8 @@
  * @module dsh-loop-mode
  */
 import z from '@deepseek-ai/schemastery'
+import { mkdir } from 'node:fs/promises'
+import { join } from 'node:path'
 import {
   MODE_EVENT_TYPE, loopModeProjection, modeOverrideOf, effectiveEnabled, planWanted, sessionPresetOf, resolveMode,
 } from './mode.ts'
@@ -45,7 +47,7 @@ import {
 import {
   resolveGateAllowlist, buildGuidance, buildVerifierPrompt, buildFullReviewPrompts, REVIEW_DIRECTIONS,
   VERDICT_SCHEMA, filterAssemblyTools, stripPluginTools, isDeniedByGate, isPluginTool, isTopLevel,
-  fenceField, fenceNonce, roleMarkerLine, TASK_PREAMBLE,
+  fenceNonce, roleMarkerLine, normalizeFanoutTasks, fanoutContextLine, buildExecutorPromptBody,
 } from './protocol.ts'
 import {
   parseModelSpec, agentOptionsFor, formatRoute, validateModelRoute,
@@ -91,6 +93,8 @@ export const Config = z.object({
     .description('验收者的思考强度档位（volatile，可留空）。'),
   quickVerifyBudget: z.number().min(1).max(10).default(3).volatile()
     .description('每 goal 连续快速验收预算（默认 3）：用尽后 loop_verify 拒绝 quick、要求 mode=full（三方向全量评审）。保存即时生效。'),
+  maxFanout: z.number().min(2).max(8).default(4).volatile()
+    .description('每次并发 fan-out 的执行者数量上限（volatile，默认 4，范围 2-8）：loop_task 的 tasks[] 形式一次最多并发启动几个执行者。并发容量同时受宿主活动子代理上限（maxActiveSubagents，默认 8）约束——超容量的启动按任务显式失败并回报，不会静默丢弃。保存即时生效。'),
   loopPresetId: z.string().default('loop').volatile()
     .description('视为"默认开启 loop 模式"的 Agent 预设 id（默认 loop，即本插件 presets/loop.patch.yml 声明的预设）。会话选择了该预设即默认开模式；/loop off 仍可按会话退出。保存即时生效。'),
   delegateProvider: z.string()
@@ -218,6 +222,11 @@ export function apply(ctx: any, config: Partial<Config> = {}) {
     const value = readConfigField(config.quickVerifyBudget, 3)
     return Number.isFinite(value) && value >= 1 ? Math.floor(value) : 3
   }
+  // Concurrent fan-out cap (volatile, read live): loop_task tasks[] launches.
+  const maxFanout = (): number => {
+    const value = readConfigField(config.maxFanout, 4)
+    return Number.isFinite(value) && value >= 2 ? Math.min(Math.floor(value), 8) : 4
+  }
 
   /**
    * Resolve the delegation provider for a loop tool: the configured name
@@ -325,6 +334,7 @@ export function apply(ctx: any, config: Partial<Config> = {}) {
           seniorRoute: tierRouteText('senior'),
           verifyRoute: verifyRouteText(),
           quickVerifyBudget: quickVerifyBudget(),
+          maxFanout: maxFanout(),
         })
       },
     })
@@ -517,21 +527,42 @@ export function apply(ctx: any, config: Partial<Config> = {}) {
     const taskDisposer = ctx.tools.register({
       name: 'loop_task',
       description:
-        'Launch a TASK EXECUTOR for one round of loop work: a fresh subagent (no conversation ' +
-        'history) that receives your brief verbatim and returns its result. Choose the tier by task ' +
-        'shape: senior for complex/risky/multi-step changes or novel problems; general for routine, ' +
-        'mechanical or bounded work. The model route per tier is pinned by the plugin from deployment ' +
-        'config (generalModel/seniorModel + efforts) — do not try to select a model yourself. The ' +
-        'brief is a COMPLETE work order: background, paths, constraints, acceptance criteria; ' +
-        'anything it omits does not exist for the executor.',
+        'Launch TASK EXECUTOR(S) for one round of loop work: fresh subagent(s) (no conversation ' +
+        'history) that receive your brief verbatim and return their results. SINGLE task: pass ' +
+        '{tier, description, brief}. PARALLEL round (fan-out): when the round splits into INDEPENDENT ' +
+        'directions, pass tasks: [{description, brief, cwd?}] (2..maxFanout) — one executor per ' +
+        'direction, ALL LAUNCHED CONCURRENTLY; plan each direction yourself and, when executors write ' +
+        'files, give each a distinct cwd (a relative directory under the workspace, created for you) ' +
+        'so parallel siblings cannot collide. Choose the tier by task shape: senior for ' +
+        'complex/risky/multi-step changes or novel problems; general for routine, mechanical or ' +
+        'bounded work (the tier applies to the whole batch). The model route per tier is pinned by ' +
+        'the plugin from deployment config (generalModel/seniorModel + efforts) — do not try to ' +
+        'select a model yourself. Every brief is a COMPLETE work order: background, paths, ' +
+        'constraints, acceptance criteria; anything it omits does not exist for the executor.',
       parameters: {
         type: 'object',
         properties: {
-          tier: { type: 'string', enum: ['general', 'senior'], description: 'general=常规/机械/有界任务（默认）；senior=复杂/高风险/多步变更或新颖任务。' },
-          description: { type: 'string', description: 'A short (3-5 word) description of the task, for display.' },
-          brief: { type: 'string', description: 'The complete, self-contained work order for the executor.' },
+          tier: { type: 'string', enum: ['general', 'senior'], description: 'general=常规/机械/有界任务（默认）；senior=复杂/高风险/多步变更或新颖任务。应用于整个并发批次。' },
+          description: { type: 'string', description: 'A short (3-5 word) description of the task, for display (single-task form).' },
+          brief: { type: 'string', description: 'The complete, self-contained work order for the executor (single-task form).' },
+          tasks: {
+            type: 'array',
+            minItems: 2,
+            maxItems: 8,
+            description: 'Fan-out form: 2..maxFanout concurrent task orders for INDEPENDENT directions. cwd = per-executor relative working directory under the workspace (created automatically) — give writing tasks distinct cwds so siblings cannot collide.',
+            items: {
+              type: 'object',
+              properties: {
+                description: { type: 'string', description: 'Short label for this direction, for display.' },
+                brief: { type: 'string', description: 'The complete, self-contained work order for this executor.' },
+                cwd: { type: 'string', description: "Optional per-executor working directory, relative to the workspace (segments of [A-Za-z0-9._-], created automatically)." },
+              },
+              required: ['brief'],
+              additionalProperties: false,
+            },
+          },
         },
-        required: ['description', 'brief'],
+        required: [],
         additionalProperties: false,
       },
       // Host contract (dsh-tools.js:436): output {schema, render} is REQUIRED —
@@ -545,7 +576,7 @@ export function apply(ctx: any, config: Partial<Config> = {}) {
         },
         render: (_args: unknown, value: any) => [{ type: 'text', text: value.text }],
       },
-      async execute(args: { tier?: string; description?: string; brief?: string }, exec: any) {
+      async execute(args: { tier?: string; description?: string; brief?: string; tasks?: unknown }, exec: any) {
         const subagents = ctx.subagents
         if (subagents === undefined) throw new Error('loop_task: subagents service unavailable')
         const parent = exec?.agent
@@ -556,7 +587,11 @@ export function apply(ctx: any, config: Partial<Config> = {}) {
         const tier: ExecutorTier = args.tier === 'senior' ? 'senior' : 'general'
         const description = typeof args.description === 'string' ? args.description.trim() : ''
         const brief = typeof args.brief === 'string' ? args.brief.trim() : ''
-        if (brief.length === 0) throw new Error('loop_task: brief is required (the complete work order)')
+        const wantsFanout = Array.isArray(args.tasks)
+        if (wantsFanout && brief.length > 0) {
+          throw new Error('loop_task: pass either brief (single task) or tasks (fan-out), not both')
+        }
+        if (!wantsFanout && brief.length === 0) throw new Error('loop_task: brief is required (the complete work order)')
         const route = tierRoute(tier)
         const effort = tierEffortText(tier)
         const agentOptions = agentOptionsFor(route, effort)
@@ -572,18 +607,136 @@ export function apply(ctx: any, config: Partial<Config> = {}) {
             ? 'loop_task: no fresh-context subagent provider with agentOptions capability is registered (set config delegateProvider explicitly)'
             : 'loop_task: no fresh-context subagent provider is registered (set config delegateProvider explicitly)')
         }
+
+        // --- PARALLEL ROUND (fan-out): one executor per direction, all launched
+        // concurrently. The controller plans directions + environments (cwd per
+        // task); the plugin executes the environment setup (mkdir under the
+        // workspace root — the gated controller has no write tools) and the
+        // concurrent launches. Each launch is independent: a capacity failure
+        // (host maxActiveSubagents) or a bad directory fails THAT task loudly;
+        // the rest keep running (honest partial result, never silent drops).
+        if (wantsFanout) {
+          const normalized = normalizeFanoutTasks(args.tasks, maxFanout())
+          if (!normalized.ok) throw new Error(`loop_task: ${normalized.error}`)
+          const tasks = normalized.tasks
+          const fanTotal = tasks.length
+          const needsRoot = tasks.some((task) => task.cwd !== undefined)
+          // Guarded root (quality review, v0.9.1): a plain string local instead
+          // of a non-null assertion at the join — the needsRoot check fills it,
+          // and the invariant lives on the same screen as its use.
+          let workspaceRoot = ''
+          if (needsRoot) {
+            let root: unknown
+            try { root = ctx.workingDirectory?.get?.(parent.session) } catch { root = undefined }
+            if (typeof root !== 'string' || root.length === 0) {
+              throw new Error('loop_task fan-out: workspace root unavailable — per-task cwd needs the working-directory service')
+            }
+            workspaceRoot = root
+          }
+          // Environment setup: create every per-task directory before launch.
+          const cwdAbs: Array<string | undefined> = []
+          for (const [index, task] of tasks.entries()) {
+            if (task.cwd === undefined) { cwdAbs.push(undefined); continue }
+            const absolute = join(workspaceRoot, task.cwd)
+            try {
+              await mkdir(absolute, { recursive: true })
+            } catch (error) {
+              throw new Error(`loop_task fan-out: tasks[${index}].cwd "${task.cwd}" could not be created — ${String((error as Error)?.message ?? error)}`)
+            }
+            cwdAbs.push(absolute)
+          }
+          const fanId = fenceNonce().slice(0, 8)
+          if (typeof modeAppender !== 'function') kickAppenderLoad()
+          const results = await Promise.all(tasks.map(async (task, index) => {
+            const label = `fan ${index + 1}/${fanTotal}: ${task.description.length > 0 ? task.description : 'loop task'}`
+            // Delegation identity per child (same shape as the single path):
+            // marker first line + declared/launched ledger records, one nonce
+            // per executor.
+            const nonce = fenceNonce()
+            const prompt = `${roleMarkerLine('executor', nonce)}\n\n${buildExecutorPromptBody(fanoutContextLine(index, fanTotal, task.cwd), task.brief)}`
+            try {
+              modeAppender?.(parent.session, DELEGATION_EVENT_TYPE, { phase: 'declared', role: 'executor', nonce })
+            } catch { /* ledger degraded, launch proceeds */ }
+            try {
+              const activation = await subagents.startActivation({
+                provider: providerName,
+                label,
+                request: {
+                  prompt: [{ type: 'text', text: prompt }],
+                  parent,
+                  ...cwdAbs[index] === undefined ? {} : { cwd: cwdAbs[index] },
+                  ...agentOptions === undefined ? {} : { agentOptions },
+                },
+                signal: exec?.signal,
+                delivery: 'parent',
+              })
+              try {
+                modeAppender?.(parent.session, DELEGATION_EVENT_TYPE, {
+                  phase: 'launched', role: 'executor', nonce, childId: activation.childId, at: new Date().toISOString(),
+                })
+              } catch { /* in-memory correlation + audit below still record */ }
+              childRoles.set(activation.childId, { role: 'task', tier, sessionId: sessionIdOf(parent.session) ?? '' })
+              audit(parent.session, 'task', {
+                childId: activation.childId,
+                tier,
+                provider: providerName,
+                route: formatRoute(route, effort),
+                fanId, fanIndex: index, fanTotal,
+                ...task.cwd === undefined ? {} : { cwd: task.cwd },
+                description: preview(task.description, 60),
+                briefChars: task.brief.length,
+                briefPreview: preview(task.brief, 120),
+              })
+              return { index, ok: true as const, childId: activation.childId as string, description: task.description }
+            } catch (error) {
+              const message = String((error as Error)?.message ?? error)
+              // Ledger hygiene (review round, v0.9.1): the pre-declaration for
+              // a launch that never happened must not linger in the pending
+              // window — write an aborted record (best-effort) so the folded
+              // ledger drops it.
+              try {
+                modeAppender?.(parent.session, DELEGATION_EVENT_TYPE, { phase: 'aborted', role: 'executor', nonce })
+              } catch { /* degraded ledger: capped at 16, fail-closed upstream */ }
+              audit(parent.session, 'task', {
+                tier,
+                provider: providerName,
+                route: formatRoute(route, effort),
+                fanId, fanIndex: index, fanTotal,
+                failed: true,
+                error: preview(message, 200),
+                ...task.cwd === undefined ? {} : { cwd: task.cwd },
+                description: preview(task.description, 60),
+              })
+              return { index, ok: false as const, error: message, description: task.description }
+            }
+          }))
+          const launched = results.filter((r) => r.ok)
+          if (launched.length === 0) {
+            const failures = results.flatMap((r) => r.ok ? [] : [`tasks[${r.index}]：${r.error}`]).join('；')
+            throw new Error(`loop_task fan-out: 全部 ${fanTotal} 个并发执行者启动失败——${failures}`)
+          }
+          const lines = results.map((r) => r.ok
+            ? `  ${r.index + 1}. ${r.description.length > 0 ? preview(r.description, 40) : 'loop task'} → ${r.childId}${tasks[r.index].cwd !== undefined ? `（cwd ${tasks[r.index].cwd}）` : ''}`
+            : `  ${r.index + 1}. ✗ 启动失败：${preview(r.error, 120)}`)
+          return {
+            text:
+              `并发执行已启动：${launched.length}/${fanTotal} 个 ${tier} 执行者（provider ${providerName}${agentOptions !== undefined ? `，路由 ${formatRoute(route, effort)}` : '，默认路由'}）。\n` +
+              `${lines.join('\n')}` +
+              (launched.length < fanTotal
+                ? '\n失败的方向可稍后单独重试（或缩小并发规模）；已启动的执行者不受影响。'
+                : '') +
+              '\n各执行者的结果将分别送达；全部结算后先聚合，再对本轮的合并交付物做一次验收（MEASURE）。',
+          }
+        }
+
+        // --- SINGLE task (existing path) ---------------------------------------
         // Delegation identity (dsh-loop-memory design §3-②'): the prompt's
         // FIRST line is the stable role marker; the same nonce rides the
         // declared/launched session-log records, so a whitelist plugin can
         // bind "this child ← this role" via the parent's tamper-resistant
         // session log (the marker alone, copied elsewhere, grants nothing).
         const nonce = fenceNonce()
-        const prompt =
-          `${roleMarkerLine('executor', nonce)}\n\n` +
-          'TASK BRIEF — you are a task executor in a cybernetics control loop. You have NO conversation ' +
-          'history: this brief is everything you know. Deliver the work it orders and report the outcome ' +
-          'with concrete evidence.\n\n' +
-          `${TASK_PREAMBLE}\n\n${fenceField('WORK ORDER', brief, fenceNonce())}`
+        const prompt = `${roleMarkerLine('executor', nonce)}\n\n${buildExecutorPromptBody(undefined, brief)}`
         // Pre-declare BEFORE startActivation: the child's agent/created
         // publication fires inside the call (before childId is known), so
         // this record is the only role signal queryable at restrict time.
@@ -593,17 +746,27 @@ export function apply(ctx: any, config: Partial<Config> = {}) {
         try {
           modeAppender?.(parent.session, DELEGATION_EVENT_TYPE, { phase: 'declared', role: 'executor', nonce })
         } catch { /* ledger degraded, launch proceeds */ }
-        const activation = await subagents.startActivation({
-          provider: providerName,
-          label: description.length > 0 ? description : 'loop task',
-          request: {
-            prompt: [{ type: 'text', text: prompt }],
-            parent,
-            ...agentOptions === undefined ? {} : { agentOptions },
-          },
-          signal: exec?.signal,
-          delivery: 'parent',
-        })
+        let activation
+        try {
+          activation = await subagents.startActivation({
+            provider: providerName,
+            label: description.length > 0 ? description : 'loop task',
+            request: {
+              prompt: [{ type: 'text', text: prompt }],
+              parent,
+              ...agentOptions === undefined ? {} : { agentOptions },
+            },
+            signal: exec?.signal,
+            delivery: 'parent',
+          })
+        } catch (error) {
+          // Same ledger hygiene as the fan-out path (v0.9.1): drop the
+          // pre-declaration of a launch that never happened.
+          try {
+            modeAppender?.(parent.session, DELEGATION_EVENT_TYPE, { phase: 'aborted', role: 'executor', nonce })
+          } catch { /* degraded ledger: capped, fail-closed upstream */ }
+          throw error
+        }
         // Settle the declaration into the authoritative childId→role map.
         try {
           modeAppender?.(parent.session, DELEGATION_EVENT_TYPE, {
@@ -845,18 +1008,28 @@ export function apply(ctx: any, config: Partial<Config> = {}) {
           try {
             modeAppender?.(parent.session, DELEGATION_EVENT_TYPE, { phase: 'declared', role: 'verifier', nonce })
           } catch { /* ledger degraded, launch proceeds */ }
-          const activation = await subagents.startActivation({
-            provider: providerName,
-            label,
-            request: {
-              prompt: [{ type: 'text', text: `${roleMarkerLine('verifier', nonce)}\n\n${prompt}` }],
-              parent,
-              outputSchema: VERDICT_SCHEMA,
-              ...agentOptions === undefined ? {} : { agentOptions },
-            },
-            signal: exec?.signal,
-            delivery: 'parent',
-          })
+          let activation
+          try {
+            activation = await subagents.startActivation({
+              provider: providerName,
+              label,
+              request: {
+                prompt: [{ type: 'text', text: `${roleMarkerLine('verifier', nonce)}\n\n${prompt}` }],
+                parent,
+                outputSchema: VERDICT_SCHEMA,
+                ...agentOptions === undefined ? {} : { agentOptions },
+              },
+              signal: exec?.signal,
+              delivery: 'parent',
+            })
+          } catch (error) {
+            // Ledger hygiene (review round, v0.9.1): drop the pre-declaration
+            // of a launch that never happened (same as loop_task paths).
+            try {
+              modeAppender?.(parent.session, DELEGATION_EVENT_TYPE, { phase: 'aborted', role: 'verifier', nonce })
+            } catch { /* degraded ledger: capped, fail-closed upstream */ }
+            throw error
+          }
           try {
             modeAppender?.(parent.session, DELEGATION_EVENT_TYPE, {
               phase: 'launched', role: 'verifier', nonce, childId: activation.childId, at: new Date().toISOString(),
@@ -866,26 +1039,64 @@ export function apply(ctx: any, config: Partial<Config> = {}) {
         }
         if (mode === 'full') {
           const prompts = buildFullReviewPrompts({ objective, criteria, deliverable, report: args.report })
-          const childIds: string[] = []
-          for (const direction of REVIEW_DIRECTIONS) {
-            const childId = await launch(`loop verify: ${direction}`, prompts[direction])
-            childRoles.set(childId, { role: 'verify', direction, sessionId: sessionIdOf(parent.session) ?? '' })
-            if (typeof modeAppender !== 'function') kickAppenderLoad()
+          // Concurrent verification (v0.9.0): the three direction reviewers
+          // are launched CONCURRENTLY — Promise.all over the per-direction
+          // launches (each internally declared→startActivation→launched, so
+          // per-nonce ordering holds under interleaving). Partial-failure
+          // semantics (review round, v0.9.1): the host rolls back ONLY the
+          // activation whose admission failed; already-launched siblings stay
+          // resident and WILL deliver verdicts. A failed direction therefore
+          // fails loudly per direction — the result reports exactly which
+          // reviewers are live and which failed, instead of rejecting with a
+          // raw error while orphan verifiers run unnoticed. The round can
+          // never be met with a missing direction (met requires ALL THREE).
+          const results = await Promise.all(REVIEW_DIRECTIONS.map(async (direction) => {
             try {
-              // Durable pacing ledger: one ignorable session-log record per
-              // launch — executors cannot write this channel (security fix).
-              modeAppender?.(parent.session, VERIFY_EVENT_TYPE, { goalId: goalId ?? null, mode: 'full', direction })
-            } catch { /* the audit file below still records the launch */ }
-            audit(parent.session, 'verify', {
-              childId, mode, direction, goalId,
-              provider: providerName, route: routeText,
-              criteriaPreview: preview(criteria, 100), deliverablePreview: preview(deliverable, 100),
-            })
-            childIds.push(childId)
+              const childId = await launch(`loop verify: ${direction}`, prompts[direction])
+              childRoles.set(childId, { role: 'verify', direction, sessionId: sessionIdOf(parent.session) ?? '' })
+              if (typeof modeAppender !== 'function') kickAppenderLoad()
+              try {
+                // Durable pacing ledger: one ignorable session-log record per
+                // launch — executors cannot write this channel (security fix).
+                modeAppender?.(parent.session, VERIFY_EVENT_TYPE, { goalId: goalId ?? null, mode: 'full', direction })
+              } catch { /* the audit file below still records the launch */ }
+              audit(parent.session, 'verify', {
+                childId, mode, direction, goalId,
+                provider: providerName, route: routeText,
+                criteriaPreview: preview(criteria, 100), deliverablePreview: preview(deliverable, 100),
+              })
+              return { direction, ok: true as const, childId }
+            } catch (error) {
+              const message = String((error as Error)?.message ?? error)
+              audit(parent.session, 'verify', {
+                mode, direction, goalId,
+                provider: providerName, route: routeText,
+                failed: true,
+                error: preview(message, 200),
+                criteriaPreview: preview(criteria, 100), deliverablePreview: preview(deliverable, 100),
+              })
+              return { direction, ok: false as const, error: message }
+            }
+          }))
+          const launched = results.filter((r) => r.ok)
+          if (launched.length === 0) {
+            const failures = results.flatMap((r) => r.ok ? [] : [`${r.direction}：${r.error}`]).join('；')
+            throw new Error(`loop_verify full: 三个方向的评审者全部启动失败——${failures}`)
           }
+          if (launched.length < REVIEW_DIRECTIONS.length) {
+            const live = launched.map((r) => `${r.direction}=${r.childId}`).join('、')
+            const failed = results.flatMap((r) => r.ok ? [] : [`${r.direction}（${preview(r.error, 120)}）`]).join('、')
+            return {
+              text:
+                `全量验收部分启动：${launched.length}/${REVIEW_DIRECTIONS.length}——已启动 ${live}；启动失败 ${failed}。` +
+                '已启动的评审者将继续运行并送达 verdict，但本轮无法满足 met（需三方向全过）。' +
+                '可等待已启动方向的 verdict 作为反馈后重试 full；若要弃轮，用 interrupt_agent 中止已启动的评审者。',
+            }
+          }
+          const childIds = launched.map((r) => r.childId)
           return {
             text:
-              `全量验收已启动：三个独立评审者（architecture / security / quality）${childIds.map((id, i) => `${REVIEW_DIRECTIONS[i]}=${id}`).join('、')}，` +
+              `全量验收已启动：三个独立评审者并发执行（architecture / security / quality）${childIds.map((id, i) => `${REVIEW_DIRECTIONS[i]}=${id}`).join('、')}，` +
               `provider ${providerName}${agentOptions !== undefined ? `，路由 ${routeText}` : '，默认路由'}。` +
               '三份 verdict 将分别送达；全部 met 才算本轮通过——聚合所有方向的 gaps 构造矫正 brief。',
           }
@@ -1071,7 +1282,8 @@ export function apply(ctx: any, config: Partial<Config> = {}) {
           `- 硬门 gate：${gateOn() ? 'on（模式开启的会话装配）' : 'off（模式只剩协议引导）'}\n` +
           `- 每目标矫正轮上限 maxRounds：${maxRounds()}\n` +
           `- 角色路由：通用执行者 → ${tierRouteText('general')}；高级执行者 → ${tierRouteText('senior')}；验收者 → ${verifyRouteText()}\n` +
-          `- 验收分层：quick 单验收者（每 goal 预算 ${quickVerifyBudget()} 次），full=架构/安全/质量三方向独立评审\n` +
+          `- 验收分层：quick 单验收者（每 goal 预算 ${quickVerifyBudget()} 次），full=架构/安全/质量三方向独立评审（并发启动）\n` +
+          `- 并发 fan-out：loop_task tasks[] 一次最多 ${maxFanout()} 个并发执行者（tier 作用于整批；受宿主活动子代理容量约束）\n` +
           `${chainText}\n` +
           `用法：/loop on | /loop off | /loop status | /loop report（测量报告）`,
       }

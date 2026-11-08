@@ -160,7 +160,7 @@ await okAsync('every field spec maps to a real volatile Config field', async () 
   if (Config === null) { console.log('  (index.ts unresolvable here — skip cross-check)'); return }
   const declared = new Set(Object.keys(Config.dict ?? Config.shape ?? {}))
   const sourceText = source
-  for (const field of ['defaultOn', 'gate', 'maxRounds', 'generalModel', 'generalEffort', 'seniorModel', 'seniorEffort', 'verifyModel', 'verifyEffort', 'quickVerifyBudget']) {
+  for (const field of ['defaultOn', 'gate', 'maxRounds', 'generalModel', 'generalEffort', 'seniorModel', 'seniorEffort', 'verifyModel', 'verifyEffort', 'quickVerifyBudget', 'maxFanout']) {
     assert.ok(declared.has(field), `Config must declare ${field}`)
     assert.ok(sourceText.includes(`field: '${field}'`), `card must render ${field}`)
   }

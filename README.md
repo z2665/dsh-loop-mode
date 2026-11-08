@@ -8,7 +8,7 @@
 
 `/loop on` 之后，会话变成一个反馈控制回路的控制器——目标（setpoint）→ 委派执行者（act）→ 独立验收（measure）→ 校准（calibrate），用户作为外环校准者。
 
-[![tests](https://img.shields.io/badge/offline%20tests-43%2B5-brightgreen)](#离线测试) ![license](https://img.shields.io/badge/license-MIT-blue) ![platform](https://img.shields.io/badge/platform-DSH%20plugin-9b59b6)
+[![tests](https://img.shields.io/badge/offline%20tests-61%2B8-brightgreen)](#离线测试) ![license](https://img.shields.io/badge/license-MIT-blue) ![platform](https://img.shields.io/badge/platform-DSH%20plugin-9b59b6)
 
 </div>
 
@@ -41,8 +41,8 @@ pnpm install
 模式开启后注入的控制回路协议（系统提示段要点）：
 
 1. **SETPOINT** — `create_goal`：objective 携带可检验验收标准 + `maxGoalRounds` 轮预算。目标不可原地改写（`update_goal` 被结构性摘除），唯一改目标动词是 `loop_revise`（reason 必填、append-only 审计链）。
-2. **ACT** — `loop_task {tier, description, brief}`：执行者分两档——**通用执行者**（general，常规/机械/有界任务）与**高级执行者**（senior，复杂/高风险/多步变更）。tier 由控制器按任务形态选择，**档内模型路由由插件钉死**，逐次不可绕过。执行者是 fresh 子代理，brief 即它的全部世界。
-3. **MEASURE** — `loop_verify {criteria, deliverable, report, mode}`：验收分层——**quick**（单验收者，短期质量焦点，用于矫正迭代）与 **full**（三个独立评审者：架构与遵从度 / 安全 / 代码质量，全过才算 met）。每 goal quick 预算（默认 3，可配）用尽后工具**拒绝 quick 并强制 full**。验收者的提示词、路由与输出契约全部由插件署名，verdict 形状经平台 `outputSchema` 强制。
+2. **ACT** — `loop_task {tier, description, brief}`：执行者分两档——**通用执行者**（general，常规/机械/有界任务）与**高级执行者**（senior，复杂/高风险/多步变更）。tier 由控制器按任务形态选择，**档内模型路由由插件钉死**，逐次不可绕过。执行者是 fresh 子代理，brief 即它的全部世界。**并发轮（fan-out）**：当一轮工作可拆成相互独立的方向，控制器改传 `tasks: [{description, brief, cwd?}]`（2..maxFanout）——每个方向一个执行者**并发启动**；控制器负责规划方向与环境（写文件的方向给各自独立的 `cwd` 相对目录，插件负责创建），方向之间不得在本轮内相互依赖；fan-out 算一次 act，全部结算后聚合，再对合并交付物做一次验收。单个方向启动失败（如超宿主活动子代理容量）显式回报，不影响其余方向。
+3. **MEASURE** — `loop_verify {criteria, deliverable, report, mode}`：验收分层——**quick**（单验收者，短期质量焦点，用于矫正迭代）与 **full**（三个独立评审者：架构与遵从度 / 安全 / 代码质量，**并发启动**，全过才算 met）。每 goal quick 预算（默认 3，可配）用尽后工具**拒绝 quick 并强制 full**。验收者的提示词、路由与输出契约全部由插件署名，verdict 形状经平台 `outputSchema` 强制。
 4. **CALIBRATE** — met → 回报并 `loop_pause` 等用户（完成是用户的行动，控制器没有任何 complete 动词）；未 met → 用 gaps 构造矫正 brief；`goalQuestionable` → 回对话；用户确认的目标变更 → `loop_revise`。
 
 配套结构：
@@ -76,6 +76,7 @@ pnpm install
     verifyModel: ''           # 验收者路由（可与执行者不同）
     verifyEffort: ''
     quickVerifyBudget: 3      # 每 goal quick 预算，用尽强制 full
+    maxFanout: 4              # 每次 fan-out 并发执行者上限（2-8；另受宿主 maxActiveSubagents 约束）
     loopPresetId: loop        # 视为默认开启的 Agent 预设 id
     delegateProvider: ''      # subagent provider（缺省按能力自动选择）
     gateAllowlistExtra: []    # 硬门 allowlist 追加（如调研场景放行 web_fetch）
@@ -91,8 +92,8 @@ pnpm install
 ## 离线测试
 
 ```bash
-node test/smoke.mjs         # 43 项：纯逻辑 + mock 宿主装配链路（mock 复刻宿主注册期校验）
-node test/client-smoke.mjs  # 5 项：客户端设置卡片接线
+node test/smoke.mjs         # 61 项：纯逻辑 + mock 宿主装配链路（mock 复刻宿主注册期校验）
+node test/client-smoke.mjs  # 8 项：客户端设置卡片接线
 ```
 
 ## 与 dsh-cybernetics 的差异
@@ -114,7 +115,10 @@ node test/client-smoke.mjs  # 5 项：客户端设置卡片接线
 - **门禁残余通道**：allowlist 默认不含 web_fetch/web_search/skill（GET 副作用/SSRF/指令载荷面），需要时经 `gateAllowlistExtra` 恢复。
 - **plan 叠加期**：plan mode 激活期间本插件硬门整体让位（门由 dsh-plan-mode 自理）。
 - quick/full 预算按 goal 累计（非"连续"）：full 通过后不清零；新 goal 预算自然重置，轮上限钳制到部署 maxRounds。
-- 验收独立性 = 插件署名提示词 + fresh 上下文 + schema 强制，无 workflow 隔离层；证据全由执行者生成时验收质量仍受证据本身限制。
+- fan-out 并发受宿主 `maxActiveSubagents`（活动子代理上限，默认 8）约束：超容量的方向按任务显式失败并回报（部分成功是诚实结果）；per-task `cwd` 仅接受工作区内的安全相对路径（`safeCwdRel` 净化，另拒绝尾点段与 Windows 保留设备名），目录由插件在启动前创建；同一 fan-out 内 `cwd` 必须互不相同（重复被结构性拒绝——显式 cwd 即私有工作区，只读方向可省略 cwd 共享根目录）。
+- full 验收三方向并发启动，某方向启动失败时按方向显式回报：已启动方向的评审者继续运行并送达 verdict，但该轮不可能 met（需三方向全过）；控制器可采信反馈后重试，或用 `interrupt_agent` 中止弃轮。三个方向全部启动失败才整体报错。
+- 启动失败的委派（执行者与验收者）会向会话日志补写 `aborted` 委派记录，及时清理由失败启动留下的 `declared` 预声明（正常路径 declared→launched 逐 nonce 配对，失败路径 declared→aborted 收尾）。
+- 验收独立性 = 插件署名提示词 + fresh 上下文 + schema 强制，无 workflow 隔离层；证据全由执行者生成时验收质量仍受证据本身限制。fan-out 执行者共享同一文件系统（cwd 是软隔离：brief + 提示词约束作用域，非沙箱）。
 - 审计文件无轮转上限。
 
 ## 许可

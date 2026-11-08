@@ -1,6 +1,6 @@
 {
   "name": "dsh-loop-mode",
-  "version": "0.8.4",
+  "version": "0.9.1",
   "license": "MIT",
   "private": false,
   "type": "module",
@@ -47,5 +47,5 @@
   "peerDependencies": {
     "@deepseek-ai/dsh-session": "*"
   },
-  "description": "A minimal cybernetics loop MODE for DSH: /loop on turns the session into a controller (goal setpoint -> fresh subagent task -> independent plugin-authored verify -> calibrate) behind a structural hard gate, with an append-only goal revision chain (loop_revise) and schema-enforced verdicts (loop_verify). Completely inert while off."
+  "description": "A minimal cybernetics loop MODE for DSH: /loop on turns the session into a controller (goal setpoint -> fresh subagent task -> independent plugin-authored verify -> calibrate) behind a structural hard gate, with an append-only goal revision chain (loop_revise), schema-enforced verdicts (loop_verify), concurrent fan-out executors (loop_task tasks[]) and concurrent full review. Completely inert while off."
 }

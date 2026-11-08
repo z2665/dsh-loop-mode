@@ -19,6 +19,7 @@
 #       verifyModel: ''                     # volatile; verifier route
 #       verifyEffort: ''                    # volatile; verifier effort
 #       quickVerifyBudget: 3                # volatile; quick rounds per goal before full review is mandatory
+#       maxFanout: 4                       # volatile; max concurrent executors per loop_task tasks[] fan-out (2-8)
 #       loopPresetId: loop                  # volatile; the agent preset id that defaults the mode ON
 #       delegateProvider: ''                # non-volatile; subagent provider name (default: auto-select)
 #       gateAllowlistExtra: []              # non-volatile; extra tool names the gate keeps
